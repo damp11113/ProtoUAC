@@ -7,7 +7,7 @@ Email to `contact@damp11113.xyz` for get STD_TEST file for testing this codec.
 # To Do
 Profiles
 - UAC-LC (Ultimate Audio Coding - Low Complex) 🟨 Current
-- UAC-LR (Ultimate Audio Coding - Low Resource) 🟨 Current
+- UAC-LR (Ultimate Audio Coding - Low Resource) 
 - UAC-E (Ultimate Audio Coding - Efficiency)
 - UAC-SE (Ultimate Audio Coding - Superior Efficiency)
 - UAC-L (Ultimate Audio Coding - Lossless)
