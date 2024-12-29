@@ -1,9 +1,10 @@
 import wave
 import numpy as np
-from scipy.signal import resample, medfilt
+from scipy.signal import resample, butter, filtfilt, get_window
 from tqdm import tqdm  # Import tqdm for progress bar
-from MDCT import mdct, imdct
+import MDCT
 from Subband import SubbandEncoder, SubbandDecoder
+import Quantizator
 
 # Mid-Side Encoding (Stereo to Mid-Side conversion)
 def mid_side_encode(stereo_data):
@@ -57,61 +58,24 @@ def resample_audio(audio_data, orig_rate, target_rate, chunk_size=1024):
     # Concatenate all resampled chunks into a single array
     return np.concatenate(resampled_data)
 
-def clip_and_smooth(audio_data, threshold=30000):
-    # Identify samples that exceed the threshold (likely clipping)
-    over_threshold = np.abs(audio_data) > threshold
-
-    # Replace those samples with the average of their neighbors (simple interpolation)
-    for idx in np.where(over_threshold)[0]:
-        left = audio_data[idx - 1] if idx > 0 else audio_data[idx]
-        right = audio_data[idx + 1] if idx < len(audio_data) - 1 else audio_data[idx]
-        audio_data[idx] = (left + right) / 2
-    return audio_data
-
-def smooth_clipping(audio_data, window_size=5, threshold=30000):
-    # Smooth clipping by averaging neighbors around large spikes
-    smoothed_data = np.copy(audio_data)
-    for i in range(1, len(audio_data) - 1):
-        if np.abs(audio_data[i]) > threshold:
-            smoothed_data[i] = np.mean(audio_data[max(0, i - window_size): min(len(audio_data), i + window_size)])
-    return smoothed_data
-
-
-def limit_to_db_int(audio_data, target_db=-5):
-    """
-    Limit the audio data (integer format) to a specific dB level.
-
-    Parameters:
-    - audio_data: The audio data to limit (numpy array of integers).
-    - target_db: The target dB level to limit to (default is -6 dB).
-
-    Returns:
-    - The limited audio data (numpy array of integers).
-    """
-    # Calculate the current peak level of the audio (as integer max absolute value)
-    peak = np.max(np.abs(audio_data))
-
-    # The maximum possible value for 16-bit signed PCM is 32767 (for int16)
-    max_int16_value = 32767
-
-    # Calculate the scaling factor to reach the target dB
-    target_amplitude = 10 ** (target_db / 20)
-
-    # Calculate the scaling factor to limit the peak to the target level
-    scale_factor = target_amplitude * max_int16_value / peak
-
-    # Apply the scaling factor and convert back to int16 (clipping if necessary)
-    limited_audio = np.clip(audio_data * scale_factor, -max_int16_value, max_int16_value).astype(np.int16)
-
-    return limited_audio
-
+def high_pass_filter(data, cutoff, sample_rate, order=5):
+    nyquist = 0.5 * sample_rate
+    normal_cutoff = cutoff / nyquist
+    b, a = butter(order, normal_cutoff, btype='high', analog=False)
+    filtered_data = filtfilt(b, a, data)
+    return filtered_data
 
 # Main conversion process
-input_wav = './STD_TEST/std_test_input.wav'
+input_wav = './STD_TEST/std_test_input3.wav'
 output_wav = "./Output/" + input_wav.split("/")[-1] + '_output.wav'
 frame_size = 256
-resolution = "int8" # int8 int16
+resolution = "int16" # int8 int16
 num_bands = 32
+mid_max_freq = 8000
+side_max_freq = 2000
+subband_max_freq = 16000
+subbandloudness = 5
+subbandblocks = 8
 
 wavfile_input = wave.open(input_wav, 'rb')
 wavfile_output = wave.open(output_wav, 'wb')
@@ -129,67 +93,101 @@ total_frames = wavfile_input.getnframes()
 CHUNK_SIZE = int((frame_size / 1000) * sample_rate)
 print(CHUNK_SIZE)
 
-num_chunks = total_frames // CHUNK_SIZE
+hop_size = CHUNK_SIZE // 2  # Overlap between chunks (e.g., 50% overlap)
 
-sbcenc = SubbandEncoder(sample_rate=sample_rate, num_bands=num_bands, frame_size=CHUNK_SIZE // 8, f_min=4000, f_max=16000, resolution=resolution)
-sbcdec = SubbandDecoder(sample_rate=sample_rate, num_bands=num_bands, frame_size=CHUNK_SIZE // 8, f_min=4000, f_max=16000, resolution=resolution)
+
+sbcenc = SubbandEncoder(sample_rate=sample_rate, num_bands=num_bands, frame_size=CHUNK_SIZE // subbandblocks, f_min=mid_max_freq // 2, f_max=subband_max_freq, resolution=resolution)
+sbcdec = SubbandDecoder(sample_rate=sample_rate, num_bands=num_bands, frame_size=CHUNK_SIZE // subbandblocks, f_min=mid_max_freq // 2, f_max=subband_max_freq, resolution=resolution)
+
+signal = np.frombuffer(wavfile_input.readframes(total_frames), dtype=np.int16).reshape(-1, 2)
+
+window = get_window('hamming', CHUNK_SIZE)
+
+# Output signal
+output_signal = np.zeros_like(signal, dtype=np.int16)
+
+start = 0
 
 # Use tqdm for progress bar
-for _ in tqdm(range(num_chunks), desc="Processing audio chunks", unit="chunk"):
-    # Read a chunk of audio
-    frame_data = wavfile_input.readframes(CHUNK_SIZE)
+with tqdm(total=total_frames, desc="Processing Audio", unit="chunks") as pbar:
+    try:
+        while start + CHUNK_SIZE <= len(signal):
+            # Read a chunk of audio
+            chunk = signal[start:start + CHUNK_SIZE]
 
-    # Convert to numpy array and extract left and right channels
-    frame_block = np.frombuffer(frame_data, dtype=np.int16).reshape(-1, 2)
+            # Apply the window function
+            left_channel = chunk[:, 0]
+            right_channel = chunk[:, 1]
 
-    frame_block = limit_to_db_int(frame_block, target_db=-5)
+            # Apply the window to each channel
+            left_windowed = left_channel * window
+            right_windowed = right_channel * window
 
-    # encode process
+            # Stack them back together
+            windowed_chunk = np.column_stack((left_windowed, right_windowed))
 
-    # Perform Mid-Side encoding
-    mid, side = mid_side_encode(frame_block)
+            # encode process
 
-    # Downsample mid to 8kHz for ADPCM encoding and side to 4kHz for ADPCM encoding
-    mid_downsampled = resample_audio(mid, sample_rate, 8000, CHUNK_SIZE).astype(np.int16)
-    side_downsampled = resample_audio(side, sample_rate, 4000, CHUNK_SIZE).astype(np.int16)
+            # Perform Mid-Side encoding
+            mid, side = mid_side_encode(windowed_chunk)
 
-    # Encode mid and side using MDCT
-    encoded_mid = mdct(mid_downsampled)
-    encoded_side = mdct(side_downsampled)
+            mid_filtered = high_pass_filter(mid, cutoff=20, sample_rate=sample_rate).clip(-32768, 32768)
+            side_filtered = high_pass_filter(side, cutoff=20, sample_rate=sample_rate).clip(-32768, 32768)
 
-    # Encode side using SBC
-    encoded_mid_subband = sbcenc.encode(mid.astype(np.int16))
+            # Downsample mid to 8kHz for ADPCM encoding and side to 4kHz for ADPCM encoding
+            mid_downsampled = resample_audio(mid, sample_rate, mid_max_freq, CHUNK_SIZE).astype(np.int16)
+            side_downsampled = resample_audio(side, sample_rate, side_max_freq, CHUNK_SIZE).astype(np.int16)
 
-    # packaging process
+            # Encode mid and side using MDCT
+            encoded_mid = MDCT.mdct(mid_downsampled.clip(-32768, 32768))
+            encoded_side = MDCT.mdct(side_downsampled.clip(-32768, 32768))
+
+            # Encode side using SBC
+            encoded_mid_subband = sbcenc.encode(mid.astype(np.int16))
+
+            print(len(encoded_mid_subband) + len(encoded_mid) + len(encoded_side))
+
+            # decode process
+
+            # Decode mid and side using inverse MDCT (iMDCT)
+            decoded_mid = MDCT.imdct(encoded_mid)
+            decoded_side = MDCT.imdct(encoded_side)
+
+            decoded_mid_subband = sbcdec.decode(encoded_mid_subband)
+
+            # Upsample decoded mid and decoded side to original sample rate
+            decoded_mid_upsampled = resample_audio(decoded_mid, mid_max_freq, sample_rate, CHUNK_SIZE)
+            decoded_side_upsampled = resample_audio(decoded_side, side_max_freq, sample_rate, CHUNK_SIZE)
+
+            # Mix decoded_mid_upsampled and decoded_mid_subband
+            max_length = max(len(decoded_mid_upsampled), len(decoded_mid_subband))
+
+            # Pad both arrays to the max_length
+            decoded_mid_upsampled = np.pad(decoded_mid_upsampled, (0, max(0, max_length - len(decoded_mid_upsampled))),
+                                           mode='constant')
+            decoded_mid_subband = np.pad(decoded_mid_subband, (0, max(0, max_length - len(decoded_mid_subband))),
+                                         mode='constant')
+
+            # Perform the mixing operation
+            mixed_mid = (decoded_mid_upsampled) + (decoded_mid_subband * subbandloudness)
+
+            # Ensure that decoded_side_upsampled also has the same length
+            decoded_side_upsampled = np.pad(decoded_side_upsampled, (0, max(0, max_length - len(decoded_side_upsampled))), mode='constant')
+
+            # Decode back to left and right channels
+            reconstructed_frame = mid_side_decode(mixed_mid.astype(np.int16), decoded_side_upsampled).astype(np.int16)
+
+            # Add the reconstructed frame to the output buffer with clipping
+            output_signal[start:start + CHUNK_SIZE] += reconstructed_frame
 
 
-    print(len(encoded_mid_subband) + len(encoded_mid) + len(encoded_side))
+            # Advance the start position by hop_size
+            start += hop_size
 
-    # decode process
+            pbar.update(CHUNK_SIZE)
 
-    # Decode mid and side using inverse MDCT (iMDCT)
-    decoded_mid = imdct(encoded_mid)
-    decoded_side = imdct(encoded_side)
 
-    decoded_mid_subband = clip_and_smooth(sbcdec.decode(encoded_mid_subband))
-
-    # Upsample decoded mid and decoded side to original sample rate
-    decoded_mid_upsampled = resample_audio(decoded_mid, 8000, sample_rate, CHUNK_SIZE)
-    decoded_side_upsampled = resample_audio(decoded_side, 4000, sample_rate, CHUNK_SIZE)
-
-    # Mix decoded_mid_upsampled and decoded_mid_subband
-    max_length = max(len(decoded_mid_upsampled), len(decoded_mid_subband))
-    decoded_mid_upsampled = np.pad(decoded_mid_upsampled, (0, max_length - len(decoded_mid_upsampled)), mode='constant')
-    decoded_mid_subband = np.pad(decoded_mid_subband, (0, max_length - len(decoded_mid_subband)), mode='constant')
-    mixed_mid = decoded_mid_upsampled + (decoded_mid_subband * 3.5).astype(np.int16)
-
-    # Ensure that decoded_side_upsampled also has the same length
-    decoded_side_upsampled = np.pad(decoded_side_upsampled, (0, max_length - len(decoded_side_upsampled)), mode='constant')
-
-    # Decode back to left and right channels
-    reconstructed_frame = mid_side_decode(mixed_mid, decoded_side_upsampled).astype(np.int16)
-
-    # Normalize and write the output to the fil
-    output = reconstructed_frame
-    wavfile_output.writeframes(output.tobytes())
-
+    finally:
+        print(output_signal)
+        wavfile_output.writeframes(output_signal.astype(np.int16).tobytes())
+        wavfile_output.close()

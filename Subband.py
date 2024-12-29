@@ -95,22 +95,19 @@ class SubbandDecoder:
         b, a = signal.butter(4, [low, high], btype='band')
         return b, a
 
-    def _generate_noise(self, total_samples):
-        """Generate noise based on the selected noise type."""
+    def _generate_noise(self, num_samples):
+        """Generate noise for a specific number of samples."""
         if self.noise_type == 'white':
-            return np.random.randn(self.num_bands, total_samples)  # White noise (Gaussian)
+            return np.random.randn(self.num_bands, num_samples)  # White noise (Gaussian)
         elif self.noise_type == 'pink':
-            # Generate pink noise using the Voss-McCartney method (spectral shaping)
-            pink_noise = np.zeros((self.num_bands, total_samples))
+            pink_noise = np.zeros((self.num_bands, num_samples))
             for i in range(self.num_bands):
-                # Generate pink noise for each band by applying a 1/f filter
-                pink_noise[i] = np.cumsum(np.random.randn(total_samples))
+                pink_noise[i] = np.cumsum(np.random.randn(num_samples))
             return pink_noise
         elif self.noise_type == 'brown':
-            # Brown noise (also called red noise)
-            brown_noise = np.zeros((self.num_bands, total_samples))
+            brown_noise = np.zeros((self.num_bands, num_samples))
             for i in range(self.num_bands):
-                brown_noise[i] = np.cumsum(np.random.randn(total_samples)) * 0.1  # More smoothing
+                brown_noise[i] = np.cumsum(np.random.randn(num_samples)) * 0.1
             return brown_noise
         else:
             raise ValueError("Unsupported noise type. Choose 'white', 'pink', or 'brown'.")
@@ -122,13 +119,9 @@ class SubbandDecoder:
         packed_data = packed_data[4:]  # Remove the metadata
 
         # Calculate size of each frame's data
-        frame_data_size = self.num_bands * (1 if self.resolution == 'int8' else 2)  # 1 byte for int8, 2 bytes for int16
+        frame_data_size = self.num_bands * (1 if self.resolution == 'int8' else 2)
 
-        # Precompute noise for all frames and bands
-        total_samples = num_frames * self.frame_size
-        noise = self._generate_noise(total_samples)
-
-        reconstructed_signal = np.zeros(total_samples)
+        reconstructed_signal = []
 
         # Loop through frames and unpack the data
         for frame in range(num_frames):
@@ -139,25 +132,28 @@ class SubbandDecoder:
             # Unpack the frame data
             if self.resolution == 'int8':
                 subband_values = np.array(struct.unpack(f"{self.num_bands}b", frame_data), dtype=np.float32)
-                subband_values = subband_values / 127.0  # Scale back to [-1, 1] range
+                subband_values = subband_values / 127.0
             elif self.resolution == 'int16':
                 subband_values = np.array(struct.unpack(f"{self.num_bands}h", frame_data), dtype=np.float32)
-                subband_values = subband_values / 32767.0  # Scale back to [-1, 1] range
+                subband_values = subband_values / 32767.0
             else:
                 raise ValueError("Unsupported resolution. Choose 'int8' or 'int16'.")
 
-            # Generate the noise for this frame based on the selected noise type
-            frame_start = frame * self.frame_size
-            frame_end = frame_start + self.frame_size
+            # Generate noise for the current frame
+            noise = self._generate_noise(self.frame_size)
 
             # Apply subband values as scaling factors to the noise
-            scaled_noise = noise[:, frame_start:frame_end] * subband_values[:, None]
+            scaled_noise = noise * subband_values[:, None]
 
             # Filter each band's noise and sum them
+            frame_signal = np.zeros(self.frame_size)
             for i, (b, a) in enumerate(self.filters):
                 filtered_signal = signal.filtfilt(b, a, scaled_noise[i])
-                reconstructed_signal[frame_start:frame_end] += filtered_signal
+                frame_signal += filtered_signal
 
-        # Scale back to int16 range
-        reconstructed_signal = np.clip(reconstructed_signal * 32768.0, -32768, 32767).astype(np.int16)
+            # Append the processed frame to the output
+            reconstructed_signal.extend(frame_signal)
+
+        # Convert the reconstructed signal to int16
+        reconstructed_signal = np.clip(np.array(reconstructed_signal) * 32768.0, -32768, 32767).astype(np.int16)
         return reconstructed_signal
