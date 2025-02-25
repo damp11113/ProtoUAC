@@ -3,7 +3,7 @@ import numpy as np
 from scipy.signal import resample, medfilt
 from tqdm import tqdm  # Import tqdm for progress bar
 import ADPCM
-from Subband import SubbandEncoder, SubbandDecoder
+from SubNoise import SubbandEncoder, SubbandDecoder
 
 
 # Mid-Side Encoding (Stereo to Mid-Side conversion)

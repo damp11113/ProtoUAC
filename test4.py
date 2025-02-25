@@ -3,8 +3,9 @@ import numpy as np
 from scipy.signal import resample, butter, filtfilt, get_window
 from tqdm import tqdm  # Import tqdm for progress bar
 import MDCT
-from Subband import SubbandEncoder, SubbandDecoder
+from SubNoise import SubNoiseEncoder, SubNoiseDecoder
 import Quantizator
+import Perceptual
 
 # Mid-Side Encoding (Stereo to Mid-Side conversion)
 def mid_side_encode(stereo_data):
@@ -66,16 +67,16 @@ def high_pass_filter(data, cutoff, sample_rate, order=5):
     return filtered_data
 
 # Main conversion process
-input_wav = './STD_TEST/std_test_input3.wav'
-output_wav = "./Output/" + input_wav.split("/")[-1] + '_output.wav'
+input_wav = './STD_TEST/DumDum_compressed.wav'
+output_wav = "./Output/" + input_wav.split("/")[-1] + '3_output.wav'
 frame_size = 256
 resolution = "int16" # int8 int16
 num_bands = 32
 mid_max_freq = 8000
-side_max_freq = 2000
+side_max_freq = 4000
 subband_max_freq = 16000
-subbandloudness = 5
-subbandblocks = 8
+subbandloudness = 2.5
+subbandblocks = 16
 
 wavfile_input = wave.open(input_wav, 'rb')
 wavfile_output = wave.open(output_wav, 'wb')
@@ -93,11 +94,10 @@ total_frames = wavfile_input.getnframes()
 CHUNK_SIZE = int((frame_size / 1000) * sample_rate)
 print(CHUNK_SIZE)
 
-hop_size = CHUNK_SIZE // 2  # Overlap between chunks (e.g., 50% overlap)
+hop_size = CHUNK_SIZE // 3  # Overlap between chunks (e.g., 50% overlap)
 
-
-sbcenc = SubbandEncoder(sample_rate=sample_rate, num_bands=num_bands, frame_size=CHUNK_SIZE // subbandblocks, f_min=mid_max_freq // 2, f_max=subband_max_freq, resolution=resolution)
-sbcdec = SubbandDecoder(sample_rate=sample_rate, num_bands=num_bands, frame_size=CHUNK_SIZE // subbandblocks, f_min=mid_max_freq // 2, f_max=subband_max_freq, resolution=resolution)
+sbcenc = SubNoiseEncoder(sample_rate=sample_rate, num_bands=num_bands, frame_size=CHUNK_SIZE // subbandblocks, f_min=mid_max_freq // 2, f_max=subband_max_freq, resolution=resolution)
+sbcdec = SubNoiseDecoder(sample_rate=sample_rate, num_bands=num_bands, frame_size=CHUNK_SIZE // subbandblocks, f_min=mid_max_freq // 2, f_max=subband_max_freq, resolution=resolution)
 
 signal = np.frombuffer(wavfile_input.readframes(total_frames), dtype=np.int16).reshape(-1, 2)
 
@@ -131,8 +131,8 @@ with tqdm(total=total_frames, desc="Processing Audio", unit="chunks") as pbar:
             # Perform Mid-Side encoding
             mid, side = mid_side_encode(windowed_chunk)
 
-            mid_filtered = high_pass_filter(mid, cutoff=20, sample_rate=sample_rate).clip(-32768, 32768)
-            side_filtered = high_pass_filter(side, cutoff=20, sample_rate=sample_rate).clip(-32768, 32768)
+            # mid = high_pass_filter(mid, cutoff=20, sample_rate=sample_rate).clip(-32768, 32768)
+            # side = high_pass_filter(side, cutoff=20, sample_rate=sample_rate).clip(-32768, 32768)
 
             # Downsample mid to 8kHz for ADPCM encoding and side to 4kHz for ADPCM encoding
             mid_downsampled = resample_audio(mid, sample_rate, mid_max_freq, CHUNK_SIZE).astype(np.int16)

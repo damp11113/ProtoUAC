@@ -3,7 +3,7 @@ import numpy as np
 from scipy.signal import resample, medfilt, windows
 from tqdm import tqdm  # Import tqdm for progress bar
 from MDCT import mdct, imdct, mdct4_mono, imdct4_mono
-from Subband import SubbandEncoder, SubbandDecoder
+from SubNoise import SubbandEncoder, SubbandDecoder
 from Quantizator import DQInt8Complex, QComplexInt8
 
 def mid_side_encode(stereo_data):

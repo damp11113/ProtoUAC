@@ -2,7 +2,7 @@ import struct
 import wave
 import numpy as np
 import pyaudio
-from Subband import SubbandEncoder, SubbandDecoder
+from SubNoise import SubbandEncoder, SubbandDecoder
 
 CHUNK_SIZE = 1024  # Make this match the frame_size in SubbandEncoder/Decoder
 SAMPLE_FORMAT = pyaudio.paInt16

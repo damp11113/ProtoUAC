@@ -4,7 +4,7 @@ import scipy.io.wavfile as wav
 from scipy.signal import resample, butter, filtfilt
 from tqdm import tqdm  # Import tqdm for progress bar
 import ADPCM
-from Subband import SubbandEncoder, SubbandDecoder
+from SubNoise import SubbandEncoder, SubbandDecoder
 
 # Normalize function to prevent clipping and loudness issues
 def normalize_audio(audio_data):
