@@ -4,14 +4,14 @@ import scipy.signal as scsignal
 from tqdm import tqdm
 import SubPS
 
-input_wav = './STD_TEST/STD_Audio_Sample_Test_v2.wav'
+input_wav = './STD_TEST/sample_compressed.wav'
 output_wav = "./Output/" + input_wav.split("/")[-1] + '_PS_output.wav'
 frame_size = 60
 resolution = "int8" # int8 int16
-SubPS_bands = 16
+SubPS_bands = 32
 SubPS_min_freq = 520
 SubPS_max_freq = 8000
-SubPS_SubFrame_scale = 2
+SubPS_SubFrame_scale = 8
 
 wavfile_input = wave.open(input_wav, 'rb')
 wavfile_output = wave.open(output_wav, 'wb')

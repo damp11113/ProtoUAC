@@ -28,12 +28,13 @@ class SubPSEncoder:
         return b, a
 
     def _calculate_icld_vectorized(self, subbandsL, subbandsR):
-
         power_left = np.sqrt(np.mean(np.square(subbandsL), axis=1))
         power_right = np.sqrt(np.mean(np.square(subbandsR), axis=1))
 
         icld = 20 * np.log10(power_left / power_right)
-        icld[power_left < power_right] *= -1
+
+        # Ensure that positive values indicate left dominance, and negative indicate right
+        icld = np.where(power_left >= power_right, np.abs(icld), -np.abs(icld))
 
         return icld
 
@@ -128,12 +129,17 @@ class SubPSDecoder:
         b, a = signal.butter(4, high, btype='high')
         return b, a
 
-    def _icld_apply(self, mono_signal, icld_value):
-        icld_value = icld_value
-
+    def icld_apply(self, mono_signal, icld_value):
+        # Convert ICLD (dB) to linear scale
         gain_left = 10 ** (icld_value / 20.0)
-        gain_right = 1.0 / gain_left
+        gain_right = 10 ** (-icld_value / 20.0)
 
+        # Normalize gains to maintain energy balance
+        norm_factor = np.sqrt(1 / (gain_left ** 2 + gain_right ** 2))
+        gain_left *= norm_factor
+        gain_right *= norm_factor
+
+        # Apply panning
         left = mono_signal * gain_left
         right = mono_signal * gain_right
 
@@ -169,7 +175,7 @@ class SubPSDecoder:
 
             for band_idx, (b, a) in enumerate(self.filters):
                 subband = signal.filtfilt(b, a, mono_signal[frame * self.frame_size:(frame + 1) * self.frame_size])
-                gain_left, gain_right = self._icld_apply(subband, subband_values[band_idx])
+                gain_left, gain_right = self.icld_apply(subband, subband_values[band_idx])
                 left_frame += gain_left
                 right_frame += gain_right
 
