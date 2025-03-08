@@ -91,11 +91,16 @@ class SubPSEncoder:
         return mono_output, packed_data
 
 class SubPSDecoder:
-    def __init__(self, sample_rate=48000, num_bands=32, f_min=4000, f_max=16000, frame_size=512, resolution='int16'):
+    def __init__(self, sample_rate=48000, num_bands=32, f_min=4000, f_max=16000, frame_size=512, resolution='int16', smoothing_factor=0.1):
         self.fs = sample_rate
         self.num_bands = num_bands - 1  # Adjust for the frequency ranges
         self.frame_size = frame_size
         self.resolution = resolution  # User-defined resolution (e.g., 'int8', 'int16')
+
+        # Smoothing factor for panning
+        self.smoothing_factor = smoothing_factor
+        self.prev_gain_left = 1.0
+        self.prev_gain_right = 1.0
 
         # Create frequency bands
         self.bands_freq = np.round(np.logspace(np.log10(f_min), np.log10(f_max), num=num_bands)).astype(int)
@@ -134,16 +139,28 @@ class SubPSDecoder:
         gain_left = 10 ** (icld_value / 20.0)
         gain_right = 10 ** (-icld_value / 20.0)
 
+        # Smooth the gain transitions over time
+        gain_left = self.smooth_gain(self.prev_gain_left, gain_left)
+        gain_right = self.smooth_gain(self.prev_gain_right, gain_right)
+
         # Normalize gains to maintain energy balance
         norm_factor = np.sqrt(1 / (gain_left ** 2 + gain_right ** 2))
         gain_left *= norm_factor
         gain_right *= norm_factor
+
+        # Store the current gains for the next frame
+        self.prev_gain_left = gain_left
+        self.prev_gain_right = gain_right
 
         # Apply panning
         left = mono_signal * gain_left
         right = mono_signal * gain_right
 
         return left, right
+
+    def smooth_gain(self, prev_gain, current_gain):
+        # Apply exponential smoothing to the gain values
+        return (1 - self.smoothing_factor) * prev_gain + self.smoothing_factor * current_gain
 
     def decode(self, mono_signal, packed_data):
         num_frames = struct.unpack("I", packed_data[:4])[0]

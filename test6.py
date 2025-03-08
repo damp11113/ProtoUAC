@@ -6,7 +6,7 @@ import SubPS
 
 input_wav = './STD_TEST/sample_compressed.wav'
 output_wav = "./Output/" + input_wav.split("/")[-1] + '_PS_output.wav'
-frame_size = 60
+frame_size = 256
 resolution = "int8" # int8 int16
 SubPS_bands = 32
 SubPS_min_freq = 520
