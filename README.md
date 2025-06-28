@@ -1,4 +1,4 @@
-# UAC-Prototype
+# UAC-Prototype (concept)
 
 A Ultimate Audio Coding prototype in python. This codec is use compression algorithm **ADPCM / MDCT-Hybrid Subband** (Noise Subbands). This version is support only stereo channel because this codec is use **Mid/Side**.
 
