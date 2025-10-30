@@ -2,7 +2,6 @@ from typing import Tuple
 import numpy as np
 from scipy import signal
 
-
 def detect_max_freq_response(fft_result, freq, noise_threshold_db):
     """
     Detect the maximum frequency with significant energy above the noise threshold.

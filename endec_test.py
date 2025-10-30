@@ -13,20 +13,51 @@ from sbr import SBRDecoder, SBREncoder, SBRDecoderHR
 from packer import SBRDataPacker, CompressionMode,pack_stereo_metadata, unpack_stereo_metadata, SBRDataUnpacker
 from utils import apply_lowpass, detect_max_freq_response, design_lowpass_filter
 
+def spectral_complexity(audio, fs=48000, fmin=8000, fmax=16000):
+    # FFT
+    fft_data = np.fft.rfft(audio)
+    freqs = np.fft.rfftfreq(len(audio), 1/fs)
+
+    # Select 8–16 kHz band
+    band_mask = (freqs >= fmin) & (freqs <= fmax)
+    band_power = np.abs(fft_data[band_mask]) ** 2
+
+    # Avoid log(0)
+    band_power = np.maximum(band_power, 1e-12)
+
+    # Compute spectral flatness
+    geo_mean = np.exp(np.mean(np.log(band_power)))
+    arith_mean = np.mean(band_power)
+    sfm = geo_mean / arith_mean
+
+    # Compute total power in that band (for energy check)
+    band_energy_db = 10 * np.log10(np.mean(band_power))
+
+    return sfm, band_energy_db
 
 def process_chunk(chunk_data, chunk_id, filter_params, progress_queue):
     """Process a single chunk of audio data in a separate process"""
+    BBMaxFreq = 6000
+    SBRHarmonicMaxFreq = 16000
+    MaxFreq = 20000
+    SBRHRPoins = 16
+    SBRExtPoints = 8
+    PSminFreq = 150
+    PSmaxFreq = 12000
+    PSpoints = 128
+
     # SBR for High Freq
-    SBRencoder = SBREncoder(48000, 16000, 22000, 8, -50, 10, -50)
-    SBRdecoder = SBRDecoder(48000, 16000, 22000, 8)
+    SBRencoder = SBREncoder(48000, SBRHarmonicMaxFreq, MaxFreq, SBRExtPoints, -50, 10, -50)
+    SBRdecoder = SBRDecoder(48000, SBRHarmonicMaxFreq, MaxFreq, SBRExtPoints)
 
     # SBR for Harmonic
-    SBRencoderHR = SBREncoder(48000, 8000, 16000, 16, -50, 10, -50)
-    SBRdecoderHR = SBRDecoderHR(48000, 8000, 16000, 16)
+    SBRencoderHR = SBREncoder(48000, BBMaxFreq, SBRHarmonicMaxFreq, SBRHRPoins, -50, 10, -50)
+    SBRdecoderHR = SBRDecoderHR(48000, BBMaxFreq, SBRHarmonicMaxFreq, SBRHRPoins)
+    SBRdecoderHRNoise = SBRDecoder(48000, BBMaxFreq, SBRHarmonicMaxFreq, SBRHRPoins) # for noise generation (standby)
 
     # Parametrix Stereo
-    PSenc = PSEncoder(48000, 150, 14000, 200, -75)
-    PSdec = PSDecoder(48000, 150, 14000, 200)
+    PSenc = PSEncoder(48000, PSminFreq, PSmaxFreq, PSpoints, -50, use_grouping=False)
+    PSdec = PSDecoder(48000, PSminFreq, PSmaxFreq, PSpoints, use_grouping=True)
 
     filter_b, filter_a = filter_params
 
@@ -48,7 +79,7 @@ def process_chunk(chunk_data, chunk_id, filter_params, progress_queue):
     frame_count = 0
     total_hops = len(chunk_data) // hop_size
 
-    dynamic_coding = False
+    dynamic_coding = True
 
     SBRpacker = SBRDataPacker(min_db=-50.0, max_db=0.0, delta_threshold=1.0)
     SBRpackerHR = SBRDataPacker(min_db=-50.0, max_db=0.0, delta_threshold=1.0)
@@ -85,6 +116,7 @@ def process_chunk(chunk_data, chunk_id, filter_params, progress_queue):
 
         # Apply analysis window ONCE
         windowed_input = input_array * analysis_window
+        mono_audio_unwindowed = np.mean(input_array, axis=1)
         mono_audio = np.mean(windowed_input, axis=1)
 
         if dynamic_coding:
@@ -93,12 +125,40 @@ def process_chunk(chunk_data, chunk_id, filter_params, progress_queue):
             side_freq = np.fft.rfftfreq(len(side), 1 / 48000)
             max_freq_stereo = detect_max_freq_response(side_fft_result, side_freq, -30)
 
-            mid_fft_result = np.fft.rfft(mono_audio)
-            mid_freq = np.fft.rfftfreq(len(mono_audio), 1 / 48000)
-            max_freq_mid = detect_max_freq_response(mid_fft_result, mid_freq, -50)
+            mid_fft_result = np.fft.rfft(mono_audio_unwindowed)
+            mid_freq = np.fft.rfftfreq(len(mono_audio_unwindowed), 1 / 48000)
+            max_freq_mid = detect_max_freq_response(mid_fft_result, mid_freq, -65)
 
-            PSenc.set_freq(150, max_freq_stereo, 256)
-            SBRencoder.set_freq(8000, min(max_freq_mid, 13500), 32)
+            # enable SBR if needed
+            if max_freq_mid > BBMaxFreq:
+                if max_freq_mid > SBRHarmonicMaxFreq:
+                    useSBRExt = True
+                    SBRencoder.set_freq(SBRHarmonicMaxFreq, min(max_freq_mid, MaxFreq), SBRExtPoints)
+                else:
+                    useSBRExt = False
+
+                useSBR = True
+
+                SBRencoderHR.set_freq(BBMaxFreq, min(max_freq_mid, SBRHarmonicMaxFreq), SBRHRPoins)
+
+                sfm, band_db = spectral_complexity(mono_audio, 48000, BBMaxFreq, SBRHarmonicMaxFreq)
+
+                # check if spectrum is flat enough to use noise generation
+                if sfm > 0.2 and band_db > -50:
+                    useSBRNoise = True
+                else:
+                    useSBRNoise = False
+            else:
+                useSBR = False
+                useSBRNoise = False
+                useSBRExt = False
+
+            PSenc.set_freq(PSminFreq, min(max_freq_stereo, PSmaxFreq), PSpoints)
+
+        else:
+            useSBRNoise = False
+            useSBRExt = True
+            useSBR = True
 
         # Stereo analysis
         stereo_profile = PSenc.analyze(input_array, True)
@@ -107,47 +167,71 @@ def process_chunk(chunk_data, chunk_id, filter_params, progress_queue):
         ic_values = [ic >= 1 for freq, pan, ipd, ic in stereo_profile]
 
         # SBR analysis
-        SBRHF_data, is_HF_transient = SBRencoder.analyze(mono_audio, True)
-        SBRHR_data, is_HR_transient = SBRencoderHR.analyze(mono_audio, True)
+        if useSBR:
+            SBRHR_data, is_HR_transient = SBRencoderHR.analyze(mono_audio, True)
+            packedSBRHR = SBRpackerHR.pack(SBRHR_data, is_HR_transient, CompressionMode.INT8)
 
-        packedSBR = SBRpacker.pack(SBRHF_data, is_HF_transient, CompressionMode.INT8)
-        packedSBRHR = SBRpackerHR.pack(SBRHR_data, is_HR_transient, CompressionMode.INT8)
+            if useSBRExt:
+                SBRHF_data, is_HF_transient = SBRencoder.analyze(mono_audio, True)
+                packedSBR = SBRpacker.pack(SBRHF_data, is_HF_transient, CompressionMode.INT8)
 
         packedPS = pack_stereo_metadata(pan_values, ipd_values, ic_values, 0, 0, 0, len(stereo_profile))
 
         #print((len(packedSBR) + len(packedPS)) * 8)
 
+        # transmit parameters process implement on here
+
         # decoder side
         if dynamic_coding:
-            PSdec.set_freq(150, max_freq_stereo, 256)
-            SBRdecoder.set_freq(8000, min(max_freq_mid, 13500), 32)
+            PSdec.set_freq(PSminFreq, min(max_freq_stereo, PSmaxFreq), PSpoints)
+
+            if useSBR:
+                SBRdecoderHR.set_freq(BBMaxFreq, min(max_freq_mid, SBRHarmonicMaxFreq), SBRHRPoins)
+                SBRdecoderHRNoise.set_freq(BBMaxFreq, min(max_freq_mid, SBRHarmonicMaxFreq), SBRHRPoins)
+
+                if useSBRExt:
+                    SBRdecoder.set_freq(SBRHarmonicMaxFreq, min(max_freq_mid, MaxFreq), SBRExtPoints)
 
         # Apply lowpass filter
         lowpassed_audio = apply_lowpass(mono_audio, filter_b, filter_a) # simulate lossy
 
-        unpacked_energies, unpacked_transient, mode = SBRunpacker.unpack(packedSBR, prev_frame)
-        prev_frame = unpacked_energies
-
-        unpacked_energies_hr, unpacked_transient_hr, mode = SBRunpackerHR.unpack(packedSBRHR, prev_frame_hr)
-        prev_frame_hr = unpacked_energies_hr
-
         # SBR decoding
-        sbr_signal = SBRdecoder.generate(
-            frame_length=len(mono_audio),
-            band_energies=unpacked_energies,
-            is_transient=unpacked_transient
-        )
+        if useSBR:
+            unpacked_energies_hr, unpacked_transient_hr, mode = SBRunpackerHR.unpack(packedSBRHR, prev_frame_hr)
+            prev_frame_hr = unpacked_energies_hr
 
-        sbrhr_signal = SBRdecoderHR.generate(
-            baseband_mono=lowpassed_audio,
-            band_energies=unpacked_energies_hr,
-            is_transient=unpacked_transient_hr,
-            infloat=True
-        )
+            if not useSBRNoise:
+                sbrhr_signal = SBRdecoderHR.generate(
+                    baseband_mono=lowpassed_audio,
+                    band_energies=unpacked_energies_hr,
+                    is_transient=unpacked_transient_hr,
+                    infloat=True
+                )
+            else:
+                sbrhr_signal = SBRdecoderHRNoise.generate(
+                    frame_length=len(mono_audio),
+                    band_energies=unpacked_energies_hr,
+                    is_transient=unpacked_transient_hr
+                ) * 0.2
+
+            if useSBRExt:
+                unpacked_energies, unpacked_transient, mode = SBRunpacker.unpack(packedSBR, prev_frame)
+                prev_frame = unpacked_energies
+
+                sbr_signal = SBRdecoder.generate(
+                    frame_length=len(mono_audio),
+                    band_energies=unpacked_energies,
+                    is_transient=unpacked_transient
+                )
+            else:
+                sbr_signal = np.zeros_like(sbrhr_signal)
+        else:
+            sbrhr_signal = np.zeros_like(lowpassed_audio)
+            sbr_signal = np.zeros_like(lowpassed_audio)
 
         # Mix
         min_len = min(len(lowpassed_audio), len(sbr_signal))
-        output_mono = lowpassed_audio[:min_len] + sbrhr_signal[:min_len] * 1.2 + sbr_signal[:min_len] * 0.2
+        output_mono = lowpassed_audio[:min_len] + sbrhr_signal[:min_len] + sbr_signal[:min_len] * 0.2
 
         p, ip, ic, minf, maxf, points = unpack_stereo_metadata(packedPS)
 
@@ -233,7 +317,7 @@ def main():
     wout.setframerate(48000)
 
     # Configuration
-    SBR_CUTOFF = 8000
+    SBR_CUTOFF = 6000
 
     print(f"Designing lowpass filter at {SBR_CUTOFF} Hz...")
     filter_b, filter_a = design_lowpass_filter(SBR_CUTOFF, 48000, order=8)

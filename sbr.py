@@ -439,7 +439,4 @@ class SBRDecoderHR:
         # Store for next frame
         self.prev_hf_signal = hf_signal.copy()
 
-        # Final scaling (reduced from 0.3 to prevent overload)
-        hf_signal = hf_signal
-
         return hf_signal.astype(np.float32)
