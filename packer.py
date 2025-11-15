@@ -21,6 +21,17 @@ class CompressionMode(IntEnum):
     INT8 = 2
 
 
+import struct
+from typing import List, Optional, Tuple
+from enum import IntEnum
+
+
+class CompressionMode(IntEnum):
+    FLOAT32 = 0
+    INT16 = 1
+    INT8 = 2
+
+
 class SBRDataPacker:
     """Pack SBR band energies with delta encoding and compression."""
 
@@ -45,20 +56,23 @@ class SBRDataPacker:
 
         # Store previous frame for delta encoding
         self.prev_energies: Optional[List[float]] = None
+        self.prev_noises: Optional[List[bool]] = None
 
     def pack(
             self,
             band_energies: List[float],
             is_transient: bool,
+            shouldUseNoises: Optional[List[bool]] = None,
             mode: CompressionMode = CompressionMode.FLOAT32,
             use_delta: bool = True
     ) -> bytes:
         """
-        Pack band energies with delta encoding.
+        Pack band energies with delta encoding and noise flags.
 
         Args:
             band_energies: List of band energy values in dB
             is_transient: Transient detection flag
+            shouldUseNoises: Optional list of noise flags per band (True = use noise)
             mode: Compression mode (FLOAT32, INT16, or INT8)
             use_delta: Enable delta encoding (only send changed values)
 
@@ -66,6 +80,10 @@ class SBRDataPacker:
             Packed bytes with header and data
         """
         num_bands = len(band_energies)
+
+        # Validate shouldUseNoises if provided
+        if shouldUseNoises is not None and len(shouldUseNoises) != num_bands:
+            raise ValueError(f"shouldUseNoises length ({len(shouldUseNoises)}) must match band_energies ({num_bands})")
 
         # Force full frame on transients or if no previous data
         if is_transient or self.prev_energies is None or not use_delta:
@@ -79,16 +97,27 @@ class SBRDataPacker:
             values_to_encode = []
 
             for i, (curr, prev) in enumerate(zip(band_energies, self.prev_energies)):
-                if abs(curr - prev) >= self.delta_threshold:
+                # Check if energy changed
+                energy_changed = abs(curr - prev) >= self.delta_threshold
+
+                # Check if noise flag changed (if using noise flags)
+                noise_changed = False
+                if shouldUseNoises is not None and self.prev_noises is not None:
+                    noise_changed = shouldUseNoises[i] != self.prev_noises[i]
+
+                # Include if either changed
+                if energy_changed or noise_changed:
                     changed_indices.append(i)
                     values_to_encode.append(curr)
 
         # Store for next frame
         self.prev_energies = band_energies.copy()
+        self.prev_noises = shouldUseNoises.copy() if shouldUseNoises is not None else None
 
         # Header: version(1) + flags(1) + mode(1) + num_bands(2) + num_changed(2)
         version = 1
-        flags = (int(is_transient) << 0) | (int(is_delta) << 1)
+        has_noise_flags = shouldUseNoises is not None
+        flags = (int(is_transient) << 0) | (int(is_delta) << 1) | (int(has_noise_flags) << 2)
         num_changed = len(changed_indices)
 
         header = struct.pack(
@@ -139,13 +168,59 @@ class SBRDataPacker:
         else:
             raise ValueError(f"Unsupported compression mode: {mode}")
 
-        return header + indices_data + values_data
+        # Pack noise flags if present
+        if shouldUseNoises is not None:
+            if is_delta:
+                # Only pack flags for changed indices
+                noise_flags = [shouldUseNoises[i] for i in changed_indices]
+            else:
+                # Pack all flags
+                noise_flags = shouldUseNoises
+
+            # Pack as bits (8 flags per byte)
+            noise_data = self._pack_bool_flags(noise_flags)
+        else:
+            noise_data = b''
+
+        return header + indices_data + values_data + noise_data
+
+    def _pack_bool_flags(self, flags: List[bool]) -> bytes:
+        """Pack boolean flags into bytes (8 flags per byte)."""
+        num_bytes = (len(flags) + 7) // 8
+        result = bytearray(num_bytes)
+
+        for i, flag in enumerate(flags):
+            if flag:
+                byte_idx = i // 8
+                bit_idx = i % 8
+                result[byte_idx] |= (1 << bit_idx)
+
+        return bytes(result)
+
+    def _unpack_bool_flags(self, data: bytes, num_flags: int) -> List[bool]:
+        """Unpack boolean flags from bytes."""
+        flags = []
+        for i in range(num_flags):
+            byte_idx = i // 8
+            bit_idx = i % 8
+            if byte_idx < len(data):
+                flags.append(bool(data[byte_idx] & (1 << bit_idx)))
+            else:
+                flags.append(False)
+        return flags
 
     def reset(self):
         """Reset encoder state (call when starting new stream)."""
         self.prev_energies = None
+        self.prev_noises = None
 
-    def get_packed_size(self, num_bands: int, num_changed: int, mode: CompressionMode) -> int:
+    def get_packed_size(
+            self,
+            num_bands: int,
+            num_changed: int,
+            mode: CompressionMode,
+            has_noise_flags: bool = False
+    ) -> int:
         """Get the size of packed data in bytes."""
         header_size = 7
 
@@ -165,17 +240,26 @@ class SBRDataPacker:
         else:
             raise ValueError(f"Unsupported mode: {mode}")
 
-        return header_size + idx_size + val_size
+        # Noise flags size (if present)
+        noise_size = 0
+        if has_noise_flags:
+            noise_size = (num_changed + 7) // 8  # Ceiling division for bit packing
+
+        return header_size + idx_size + val_size + noise_size
 
     def get_compression_ratio(
             self,
             num_bands: int,
             num_changed: int,
-            mode: CompressionMode
+            mode: CompressionMode,
+            has_noise_flags: bool = False
     ) -> float:
         """Calculate compression ratio vs full FLOAT32 frame."""
         full_size = 7 + num_bands * 4
-        packed_size = self.get_packed_size(num_bands, num_changed, mode)
+        if has_noise_flags:
+            full_size += (num_bands + 7) // 8
+
+        packed_size = self.get_packed_size(num_bands, num_changed, mode, has_noise_flags)
         return full_size / packed_size
 
 
@@ -204,17 +288,19 @@ class SBRDataUnpacker:
     def unpack(
             self,
             data: bytes,
-            prev_frame: Optional[List[float]] = None
-    ) -> Tuple[List[float], bool, CompressionMode]:
+            prev_frame: Optional[List[float]] = None,
+            prev_noises: Optional[List[bool]] = None
+    ) -> Tuple[List[float], bool, CompressionMode, Optional[List[bool]]]:
         """
         Unpack bytes back to band energies with delta decoding.
 
         Args:
             data: Packed bytes
             prev_frame: Previous frame data (required for delta frames)
+            prev_noises: Previous noise flags (required for delta frames with noise)
 
         Returns:
-            Tuple of (band_energies, is_transient, mode)
+            Tuple of (band_energies, is_transient, mode, shouldUseNoises)
         """
         if len(data) < 7:
             raise ValueError("Data too short, invalid format")
@@ -231,6 +317,7 @@ class SBRDataUnpacker:
         mode = CompressionMode(mode_val)
         is_transient = bool(flags & 0x01)
         is_delta = bool(flags & 0x02)
+        has_noise_flags = bool(flags & 0x04)
 
         offset = 7
 
@@ -253,18 +340,26 @@ class SBRDataUnpacker:
             changed_indices = list(range(num_bands))
 
         # Read values
-        payload = data[offset:]
+        if mode == CompressionMode.FLOAT32:
+            val_size = num_changed * 4
+        elif mode == CompressionMode.INT16:
+            val_size = num_changed * 2
+        elif mode == CompressionMode.INT8:
+            val_size = num_changed
+        else:
+            raise ValueError(f"Unsupported compression mode: {mode}")
+
+        payload = data[offset:offset + val_size]
+        offset += val_size
 
         if mode == CompressionMode.FLOAT32:
-            expected_size = num_changed * 4
-            if len(payload) != expected_size:
-                raise ValueError(f"Expected {expected_size} bytes, got {len(payload)}")
+            if len(payload) != val_size:
+                raise ValueError(f"Expected {val_size} bytes, got {len(payload)}")
             changed_values = list(struct.unpack(f'{num_changed}f', payload))
 
         elif mode == CompressionMode.INT16:
-            expected_size = num_changed * 2
-            if len(payload) != expected_size:
-                raise ValueError(f"Expected {expected_size} bytes, got {len(payload)}")
+            if len(payload) != val_size:
+                raise ValueError(f"Expected {val_size} bytes, got {len(payload)}")
             int_values = struct.unpack(f'{num_changed}h', payload)
             changed_values = [
                 (val + 32768) / 65535 * self.db_range + self.min_db
@@ -272,17 +367,33 @@ class SBRDataUnpacker:
             ]
 
         elif mode == CompressionMode.INT8:
-            expected_size = num_changed
-            if len(payload) != expected_size:
-                raise ValueError(f"Expected {expected_size} bytes, got {len(payload)}")
+            if len(payload) != val_size:
+                raise ValueError(f"Expected {val_size} bytes, got {len(payload)}")
             int_values = struct.unpack(f'{num_changed}b', payload)
             changed_values = [
                 (val + 128) / 255 * self.db_range + self.min_db
                 for val in int_values
             ]
 
-        else:
-            raise ValueError(f"Unsupported compression mode: {mode}")
+        # Read noise flags if present
+        shouldUseNoises = None
+        if has_noise_flags:
+            noise_bytes = (num_changed + 7) // 8
+            noise_data = data[offset:offset + noise_bytes]
+            changed_noise_flags = self._unpack_bool_flags(noise_data, num_changed)
+
+            # Reconstruct full noise array if delta
+            if is_delta:
+                if prev_noises is None:
+                    raise ValueError("Delta frame with noise flags requires prev_noises")
+                if len(prev_noises) != num_bands:
+                    raise ValueError(f"Previous noise size mismatch: expected {num_bands}, got {len(prev_noises)}")
+
+                shouldUseNoises = prev_noises.copy()
+                for idx, flag in zip(changed_indices, changed_noise_flags):
+                    shouldUseNoises[idx] = flag
+            else:
+                shouldUseNoises = changed_noise_flags
 
         # Reconstruct full frame
         if is_delta:
@@ -309,7 +420,19 @@ class SBRDataUnpacker:
             # Full frame
             band_energies = changed_values
 
-        return band_energies, is_transient, mode
+        return band_energies, is_transient, mode, shouldUseNoises
+
+    def _unpack_bool_flags(self, data: bytes, num_flags: int) -> List[bool]:
+        """Unpack boolean flags from bytes."""
+        flags = []
+        for i in range(num_flags):
+            byte_idx = i // 8
+            bit_idx = i % 8
+            if byte_idx < len(data):
+                flags.append(bool(data[byte_idx] & (1 << bit_idx)))
+            else:
+                flags.append(False)
+        return flags
 
     def _interpolate_missing(
             self,

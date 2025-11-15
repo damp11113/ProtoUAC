@@ -57,3 +57,8 @@ def apply_lowpass(audio: np.ndarray, b, a) -> np.ndarray:
         for ch in range(audio.shape[1]):
             filtered[:, ch] = signal.filtfilt(b, a, audio[:, ch])
         return filtered
+
+def vorbis_window(N):
+    """Generate Vorbis window function for MDCT"""
+    n = np.arange(N)
+    return np.sin(np.pi / 2 * np.sin(np.pi * (n + 0.5) / N) ** 2)
