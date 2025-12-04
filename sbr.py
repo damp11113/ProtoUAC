@@ -87,8 +87,8 @@ class SBREncoder:
         self.prev_energy = current_energy
 
         # Apply window to reduce spectral leakage
-        window = np.hanning(len(audio_float))
-        audio_windowed = audio_float * window
+        #window = np.hanning(len(audio_float))
+        #audio_windowed = audio_float * window
 
         # Calculate FFT
         n_fft = len(audio_float)
@@ -173,7 +173,7 @@ class SBRDecoder:
             freq_points: int,
             chunk_size: int = 256,
             overlap: float = 0.5,
-            noise_gain: float = 0.1
+            noise_gain: float = 0.125
     ):
         self.sample_rate = sample_rate
         self.chunk_size = chunk_size

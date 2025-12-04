@@ -1,30 +1,8 @@
 import math
-import struct
-from typing import List, Tuple, Optional
-from enum import IntEnum
-
-class CompressionMode(IntEnum):
-    """Compression modes for band energy data."""
-    FLOAT32 = 0  # 4 bytes per value, full precision
-    INT16 = 1  # 2 bytes per value, -32768 to 32767 range
-    INT8 = 2  # 1 byte per value, -128 to 127 range
-
-
+import numpy as np
 import struct
 from typing import List, Optional, Tuple
 from enum import IntEnum
-
-
-class CompressionMode(IntEnum):
-    FLOAT32 = 0
-    INT16 = 1
-    INT8 = 2
-
-
-import struct
-from typing import List, Optional, Tuple
-from enum import IntEnum
-
 
 class CompressionMode(IntEnum):
     FLOAT32 = 0
@@ -573,3 +551,285 @@ def unpack_stereo_metadata(packed_bytes):
             bits_read += 1
 
     return pan_values, ipd_values, ic_values, min_freq, max_freq, point
+
+
+def quantize_coefficients(coeffs, num_bits=8):
+    """
+    Simple uniform scalar quantization
+
+    Parameters:
+    -----------
+    coeffs : np.array
+        MDCT coefficients to quantize
+    num_bits : int
+        Number of bits for quantization (default: 8)
+
+    Returns:
+    --------
+    quantized : np.array (int)
+        Quantized coefficients
+    scale : float
+        Scale factor for dequantization
+    """
+    if len(coeffs) == 0:
+        return np.array([]), 0.0
+
+    # Find max absolute value for scaling
+    max_val = np.max(np.abs(coeffs))
+
+    if max_val == 0:
+        return np.zeros_like(coeffs, dtype=np.int16), 0.0
+
+    # Calculate quantization levels
+    max_level = (2 ** (num_bits - 1)) - 1  # Leave one bit for sign
+    scale = max_val / max_level
+
+    # Quantize
+    quantized = np.round(coeffs / scale).astype(np.int16)
+
+    return quantized, scale
+
+
+def dequantize_coefficients(quantized, scale):
+    """
+    Dequantize coefficients
+
+    Parameters:
+    -----------
+    quantized : np.array (int)
+        Quantized coefficients
+    scale : float
+        Scale factor from quantization
+
+    Returns:
+    --------
+    coeffs : np.array (float)
+        Dequantized coefficients
+    """
+    return quantized.astype(np.float32) * scale
+
+class HarmonicPacker:
+    """
+    Enhanced harmonic packer with multiple encoding options.
+
+    Data types:
+    - 'uint8': 0-255 (1 byte per value)
+    - 'uint16': 0-65535 (2 bytes per value)
+    - 'int8': -128 to 127 (1 byte per value)
+    - 'int16': -32768 to 32767 (2 bytes per value)
+    - 'float16': half precision (2 bytes per value)
+    - 'float32': single precision (4 bytes per value)
+
+    Scaling modes:
+    - 'linear': Direct linear scaling
+    - 'log': Logarithmic scaling (better for audio amplitudes)
+    - 'db': Decibel scaling (perceptually accurate)
+    """
+
+    def __init__(self, sample_rate, window_size,
+                 amp_dtype='uint8', phase_dtype='uint8',
+                 scale_mode='log', min_amp_db=-80):
+        self.sr = sample_rate
+        self.win = window_size
+        self.bin_size = sample_rate / window_size
+        self.amp_dtype = amp_dtype
+        self.phase_dtype = phase_dtype
+        self.scale_mode = scale_mode
+        self.min_amp_db = min_amp_db
+        self.min_amp_linear = 10 ** (min_amp_db / 20)
+
+        # Define packing formats
+        self.dtype_formats = {
+            'uint8': 'B',
+            'uint16': 'H',
+            'int8': 'b',
+            'int16': 'h',
+            'float16': None,  # special handling
+            'float32': 'f'
+        }
+
+        # Define value ranges
+        self.dtype_ranges = {
+            'uint8': (0, 255),
+            'uint16': (0, 65535),
+            'int8': (-128, 127),
+            'int16': (-32768, 32767),
+            'float16': (None, None),  # no quantization needed
+            'float32': (None, None)  # no quantization needed
+        }
+
+    def _encode_amplitude(self, amp, max_amp):
+        """Encode amplitude based on selected data type and scale mode."""
+        if self.amp_dtype in ['float16', 'float32']:
+            # Direct float storage, no quantization
+            return amp
+
+        # Normalize
+        if max_amp < self.min_amp_linear:
+            max_amp = self.min_amp_linear
+
+        if self.scale_mode == 'linear':
+            norm = amp / max_amp
+        elif self.scale_mode == 'log':
+            # Log scale: better resolution at low amplitudes
+            amp_safe = max(amp, self.min_amp_linear)
+            max_safe = max(max_amp, self.min_amp_linear)
+            try:
+                norm = math.log(amp_safe / self.min_amp_linear) / math.log(max_safe / self.min_amp_linear)
+            except ZeroDivisionError:
+                norm = 0.0
+
+            norm = np.clip(norm, 0, 1)
+        elif self.scale_mode == 'db':
+            # Decibel scale
+            amp_safe = max(amp, self.min_amp_linear)
+            max_safe = max(max_amp, self.min_amp_linear)
+            amp_db = 20 * math.log10(amp_safe)
+            max_db = 20 * math.log10(max_safe)
+            norm = (amp_db - self.min_amp_db) / (max_db - self.min_amp_db)
+            norm = np.clip(norm, 0, 1)
+        else:
+            norm = amp / max_amp
+
+        # Quantize to integer range
+        vmin, vmax = self.dtype_ranges[self.amp_dtype]
+        return int(norm * (vmax - vmin) + vmin)
+
+    def _decode_amplitude(self, encoded_val, max_amp):
+        """Decode amplitude from encoded value."""
+        if self.amp_dtype in ['float16', 'float32']:
+            return encoded_val
+
+        vmin, vmax = self.dtype_ranges[self.amp_dtype]
+        norm = (encoded_val - vmin) / (vmax - vmin)
+
+        if self.scale_mode == 'linear':
+            return norm * max_amp
+        elif self.scale_mode == 'log':
+            max_safe = max(max_amp, self.min_amp_linear)
+            log_ratio = math.log(max_safe / self.min_amp_linear)
+            return self.min_amp_linear * math.exp(norm * log_ratio)
+        elif self.scale_mode == 'db':
+            max_safe = max(max_amp, self.min_amp_linear)
+            max_db = 20 * math.log10(max_safe)
+            amp_db = norm * (max_db - self.min_amp_db) + self.min_amp_db
+            return 10 ** (amp_db / 20)
+        else:
+            return norm * max_amp
+
+    def _encode_phase(self, phase):
+        """Encode phase to selected data type."""
+        if self.phase_dtype in ['float16', 'float32']:
+            return phase
+
+        # Normalize phase from [-π, π] to [0, 1]
+        norm = (phase + math.pi) / (2 * math.pi)
+
+        vmin, vmax = self.dtype_ranges[self.phase_dtype]
+        return int(norm * (vmax - vmin) + vmin)
+
+    def _decode_phase(self, encoded_val):
+        """Decode phase from encoded value."""
+        if self.phase_dtype in ['float16', 'float32']:
+            return encoded_val
+
+        vmin, vmax = self.dtype_ranges[self.phase_dtype]
+        norm = (encoded_val - vmin) / (vmax - vmin)
+        return norm * (2 * math.pi) - math.pi
+
+    def _pack_value(self, value, dtype):
+        """Pack a single value according to its data type."""
+        if dtype == 'float16':
+            return np.float16(value).tobytes()
+        elif dtype == 'float32':
+            return struct.pack('f', value)
+        else:
+            fmt = self.dtype_formats[dtype]
+            return struct.pack(fmt, value)
+
+    def _unpack_value(self, data, pos, dtype):
+        """Unpack a single value and return (value, new_position)."""
+        if dtype == 'float16':
+            value = np.frombuffer(data[pos:pos + 2], dtype=np.float16)[0]
+            return float(value), pos + 2
+        elif dtype == 'float32':
+            value = struct.unpack_from('f', data, pos)[0]
+            return value, pos + 4
+        else:
+            fmt = self.dtype_formats[dtype]
+            size = struct.calcsize(fmt)
+            value = struct.unpack_from(fmt, data, pos)[0]
+            return value, pos + size
+
+    def pack_chunk(self, harmonic_objects):
+        """Pack harmonic objects into bytes."""
+        payload = bytearray()
+
+        for obj in harmonic_objects:
+            freq = obj["freq"]
+            harms = obj["harmonics"]
+            hcount = len(harms)
+
+            # Convert frequency to bin
+            freq_bin = int(freq / self.bin_size)
+
+            # Find max amplitude for scaling
+            max_amp_obj = max(h['amp'] for h in harms) if harms else self.min_amp_linear
+
+            # Pack header: freq_bin (uint16), hcount (uint8), scale_factor (float32)
+            payload += struct.pack('<HB', freq_bin, hcount)
+            payload += struct.pack('f', max_amp_obj)
+
+            # Pack each harmonic
+            for h in harms:
+                encoded_amp = self._encode_amplitude(h["amp"], max_amp_obj)
+                encoded_phase = self._encode_phase(h["phase"])
+
+                payload += self._pack_value(encoded_amp, self.amp_dtype)
+                payload += self._pack_value(encoded_phase, self.phase_dtype)
+
+        return bytes(payload)
+
+    def unpack_chunk(self, data):
+        """Unpack bytes back into harmonic objects."""
+        pos = 0
+        length = len(data)
+        objects = []
+
+        while pos < length:
+            # Read header
+            freq_bin, hcount = struct.unpack_from('<HB', data, pos)
+            pos += 3
+
+            max_amp_obj = struct.unpack_from('f', data, pos)[0]
+            pos += 4
+
+            freq = freq_bin * self.bin_size
+            harmonics = []
+
+            # Read harmonics
+            for _ in range(hcount):
+                encoded_amp, pos = self._unpack_value(data, pos, self.amp_dtype)
+                encoded_phase, pos = self._unpack_value(data, pos, self.phase_dtype)
+
+                amp = self._decode_amplitude(encoded_amp, max_amp_obj)
+                phase = self._decode_phase(encoded_phase)
+
+                harmonics.append({'amp': amp, 'phase': phase})
+
+            obj = {
+                "freq": freq,
+                "n_harmonic": hcount,
+                "main_amp": harmonics[0]["amp"] if harmonics else 0.0,
+                "harmonics": harmonics
+            }
+            objects.append(obj)
+
+        return objects
+
+    def get_bytes_per_harmonic(self):
+        """Calculate bytes per harmonic for current configuration."""
+        amp_size = 2 if self.amp_dtype == 'float16' else struct.calcsize(self.dtype_formats.get(self.amp_dtype, 'B'))
+        phase_size = 2 if self.phase_dtype == 'float16' else struct.calcsize(
+            self.dtype_formats.get(self.phase_dtype, 'B'))
+        return amp_size + phase_size

@@ -10,9 +10,9 @@ import time
 
 from parametric_coding import PSEncoder, PSDecoder
 from sbr import SBREncoder, SBRDecoder
-from MDCT import mdct4, imdct4
-from packer import SBRDataPacker, CompressionMode,pack_stereo_metadata, unpack_stereo_metadata, SBRDataUnpacker, quantize_coefficients, dequantize_coefficients
+from packer import SBRDataPacker, CompressionMode, pack_stereo_metadata, unpack_stereo_metadata, SBRDataUnpacker, HarmonicPacker
 from utils import apply_lowpass, detect_max_freq_response, design_lowpass_filter, vorbis_window
+from phxc import HarmonicExtractor, HarmonicGenerator
 
 def spectral_complexity(audio, fs=48000, fmin=8000, fmax=16000):
     # FFT
@@ -47,6 +47,7 @@ def process_chunk(chunk_data, chunk_id, progress_queue):
     PSpoints = 320
 
     frame_size = 1024 * 2
+    hop_size = frame_size // 2
 
     # SBR for Harmonic
     SBRencoder = SBREncoder(48000, BBMaxFreq, MaxFreq, SBRPoins, -80, 10, -80)
@@ -56,18 +57,16 @@ def process_chunk(chunk_data, chunk_id, progress_queue):
     PSenc = PSEncoder(48000, PSminFreq, PSmaxFreq, PSpoints, -50, use_grouping=False)
     PSdec = PSDecoder(48000, PSminFreq, PSmaxFreq, PSpoints, use_grouping=True)
 
-    hop_size = frame_size // 2
-
-    # Create normalized window (Hann window with 50% overlap has perfect reconstruction)
+    # Create windows
     MDCT_window = vorbis_window(frame_size)
-
-    # Create normalized window (Hann window with 50% overlap has perfect reconstruction)
     hann_window = np.hanning(frame_size)[:, np.newaxis]
 
-    # For perfect reconstruction with 50% overlap, scale the window
-    # sqrt(hann) gives constant overlap-add (COLA) property
-    analysis_window = np.sqrt(hann_window)
-    synthesis_window = analysis_window  # Same window for synthesis
+    # Analysis window (already in your code)
+    analysis_window = hann_window
+
+    # Synthesis window for overlap-add
+    # For perfect reconstruction with 50% overlap, use the same window
+    synthesis_window = hann_window
 
     processed_frames = []
     prev_input_hop = None
@@ -75,18 +74,40 @@ def process_chunk(chunk_data, chunk_id, progress_queue):
 
     frame_count = 0
     total_hops = len(chunk_data) // hop_size
-
     dynamic_coding = False
-    use_MDCT = False
 
     SBRpacker = SBRDataPacker(min_db=-80.0, max_db=0.0, delta_threshold=1.0)
-
     SBRunpacker = SBRDataUnpacker(min_db=-80.0, max_db=0.0)
 
-    prev_frame = None
     prev_frame_hr = None
 
-    filter_b, filter_a = design_lowpass_filter(BBMaxFreq, 48000, order=8)
+    # Initialize Extractor and Generator
+    extractor = HarmonicExtractor(
+        sample_rate=48000,
+        window_size=frame_size,
+        hop_size=hop_size,
+        min_f0_freq=20,
+        max_f0_freq=BBMaxFreq,
+        peak_threshold=0.01,
+        max_harmonics_per_f0=20,
+        max_harmonic_freq_output=BBMaxFreq,
+        max_harmonic_freq_object=20,
+        log=False
+    )
+
+    generator = HarmonicGenerator(
+        sample_rate=48000,
+        window_size=frame_size,
+        hop_size=hop_size
+    )
+
+    packer_compact = HarmonicPacker(
+        sample_rate=48000,
+        window_size=frame_size,
+        amp_dtype='uint8',
+        phase_dtype='uint8',
+        scale_mode='log'
+    )
 
     for i in range(0, len(chunk_data), hop_size):
         hop_array = chunk_data[i:i + hop_size]
@@ -112,11 +133,8 @@ def process_chunk(chunk_data, chunk_id, progress_queue):
             input_array = np.vstack((input_array, pad))
             N = frame_size
 
-        # Apply analysis window ONCE
-
-        windowed_input = input_array * analysis_window
+        # Apply analysis window
         mono_audio_unwindowed = np.mean(input_array, axis=1)
-        mono_audio = np.mean(windowed_input, axis=1)
 
         if dynamic_coding:
             side = (input_array[:, 0] - input_array[:, 1]) / 2
@@ -128,7 +146,6 @@ def process_chunk(chunk_data, chunk_id, progress_queue):
             mid_freq = np.fft.rfftfreq(len(mono_audio_unwindowed), 1 / 48000)
             max_freq_mid = detect_max_freq_response(mid_fft_result, mid_freq, -80)
 
-            # enable SBR if needed
             if max_freq_mid > BBMaxFreq:
                 useSBR = True
                 SBRencoder.set_freq(BBMaxFreq, min(max_freq_mid, MaxFreq), SBRPoins)
@@ -147,53 +164,30 @@ def process_chunk(chunk_data, chunk_id, progress_queue):
 
         # SBR analysis
         if useSBR:
-            SBR_data, shouldUseNoises, is_transient = SBRencoder.analyze(mono_audio, True, True)
+            SBR_data, shouldUseNoises, is_transient = SBRencoder.analyze(mono_audio_unwindowed, True, True)
             packedSBR = SBRpacker.pack(SBR_data, is_transient, shouldUseNoises, CompressionMode.INT8)
 
         packedPS = pack_stereo_metadata(pan_values, ipd_values, ic_values, 0, 0, 0, len(stereo_profile))
 
-        #print((len(packedSBR) + len(packedPS)) * 8)
+        harmonic_chunk = extractor.process_chunk(mono_audio_unwindowed)
+        encoded = packer_compact.pack_chunk(harmonic_chunk)
 
-        if use_MDCT:
-            windowed_mono_input = MDCT_window * mono_audio
-            mdct_coeffs = mdct4(windowed_mono_input)
-
-            #threshold = 0.02 * np.max(np.abs(mdct_coeffs))
-            #mask = np.abs(mdct_coeffs) < threshold
-            #mdct_coeffs[mask] = 0
-
-            #limited_coeffs = advanced_psychoacoustic(mdct_coeffs, bands=8, quality=10, masking_ratio=0.5, ath_offset=-20, max_freq=BBMaxFreq)
-            limited_coeffs = np.copy(mdct_coeffs)
-
-            limited_coeffs[BBMaxFreq:] = 0
-
-            quantized, qscale = quantize_coefficients(limited_coeffs, 12)
-
-        # transmit parameters process implement on here
-
-        # decoder side
+        # ==================== DECODER SIDE ====================
         if dynamic_coding:
             PSdec.set_freq(PSminFreq, min(max_freq_stereo, PSmaxFreq), PSpoints)
-
             if useSBR:
                 SBRdecoder.set_freq(BBMaxFreq, min(max_freq_mid, MaxFreq), SBRPoins)
 
-        # Apply lowpass filter
+        decoded_objects = packer_compact.unpack_chunk(encoded)
+        bb_audio = generator.process_chunk(decoded_objects)
 
-        if use_MDCT:
-            coeffs = dequantize_coefficients(quantized, qscale)
+        max_abs_val = np.max(np.abs(bb_audio))
+        if max_abs_val > 1.0e-6:
+            bb_audio = bb_audio / max_abs_val
 
-            lowpassed_audio_unwindowed = imdct4(coeffs)  # No window here!
+        bb_audio = bb_audio * 0.5
 
-            lowpassed_audio = apply_lowpass(lowpassed_audio_unwindowed, filter_b, filter_a)
-
-            lowpassed_audio_windowed = lowpassed_audio * MDCT_window
-        else:
-            # simulated loss
-            lowpassed_audio_windowed = apply_lowpass(mono_audio, filter_b, filter_a)
-            lowpassed_audio_unwindowed = lowpassed_audio_windowed
-
-        # SBR decoding (on unwindowed signal)
+        # SBR decoding
         if useSBR:
             unpacked_energies_hr, unpacked_transient_hr, mode, shouldUseNoises = SBRunpacker.unpack(
                 packedSBR,
@@ -203,49 +197,45 @@ def process_chunk(chunk_data, chunk_id, progress_queue):
             prev_frame_hr = (unpacked_energies_hr, shouldUseNoises)
 
             sbr_signal = SBRdecoder.generate(
-                baseband_mono=lowpassed_audio_windowed,  # Feed unwindowed
+                baseband_mono=bb_audio,
                 band_energies=unpacked_energies_hr,
                 is_transient=unpacked_transient_hr,
                 should_use_noises=shouldUseNoises,
                 infloat=True
             )
         else:
-            sbr_signal = np.zeros_like(lowpassed_audio_windowed)
+            sbr_signal = np.zeros_like(bb_audio)
 
-        # Mix baseband and SBR at full frame_size
-        output_mono_unwindowed = lowpassed_audio_unwindowed + sbr_signal * 0.5
+        # Mix baseband and SBR
+        output_mono_unwindowed = bb_audio + sbr_signal * 0.5
 
-        # Parametric Stereo on FULL frame
+        # Parametric Stereo
         p, ip, ic, minf, maxf, points = unpack_stereo_metadata(packedPS)
 
         reconstructed_stereo_unwindowed = PSdec.apply(
-            mono_audio=output_mono_unwindowed,  # Full frame
+            mono_audio=output_mono_unwindowed,
             pan_values=p,
             ipd_values=ip,
             ic_values=ic
         )
 
-        # Apply synthesis window to FULL frame
-        if use_MDCT:
-            reconstructed_stereo_unwindowed[:, 0] *= MDCT_window
-            reconstructed_stereo_unwindowed[:, 1] *= MDCT_window
-        else:
-            reconstructed_stereo_unwindowed *= synthesis_window
+        # ==================== KEY FIX: APPLY SYNTHESIS WINDOW ====================
+        # Apply synthesis window to decoded stereo signal
+        reconstructed_stereo_windowed = reconstructed_stereo_unwindowed * synthesis_window
 
-        # Overlap-add with FULL windowed frame
-        output_frame = reconstructed_stereo_unwindowed[:hop_size] + prev_overlap
-        prev_overlap = reconstructed_stereo_unwindowed[hop_size:].copy()
+        # Overlap-add with windowed frame
+        output_frame = reconstructed_stereo_windowed[:hop_size] + prev_overlap
+        prev_overlap = reconstructed_stereo_windowed[hop_size:].copy()
 
         processed_frames.append(output_frame)
 
-        # Report progress via queue (every 10 frames to reduce overhead)
+        # Report progress
         if frame_count % 10 == 0:
             progress_queue.put(('progress', chunk_id, frame_count, total_hops))
 
     # Final update
     progress_queue.put(('progress', chunk_id, frame_count, total_hops))
 
-    # Return processed frames and the last overlap for boundary stitching
     return chunk_id, processed_frames, prev_overlap
 
 
