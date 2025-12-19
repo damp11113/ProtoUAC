@@ -10,7 +10,7 @@ import time
 
 from parametric_coding import PSEncoder, PSDecoder
 from sbr import SBREncoder, SBRDecoder
-from packer import SBRDataPacker, CompressionMode, pack_stereo_metadata, unpack_stereo_metadata, SBRDataUnpacker, HarmonicPacker
+from packer import SBRDataPacker, CompressionMode, pack_stereo_metadata, unpack_stereo_metadata, SBRDataUnpacker, HarmonicPacker, HarmonicUnpacker
 from utils import apply_lowpass, detect_max_freq_response, design_lowpass_filter, vorbis_window
 from phxc import HarmonicExtractor, HarmonicGenerator
 
@@ -46,7 +46,7 @@ def process_chunk(chunk_data, chunk_id, progress_queue):
     PSmaxFreq = 12000
     PSpoints = 320
 
-    frame_size = 1024 * 2
+    frame_size = 1024 * 4
     hop_size = frame_size // 2
 
     # SBR for Harmonic
@@ -88,10 +88,10 @@ def process_chunk(chunk_data, chunk_id, progress_queue):
         hop_size=hop_size,
         min_f0_freq=20,
         max_f0_freq=BBMaxFreq,
-        peak_threshold=0.01,
-        max_harmonics_per_f0=20,
+        peak_threshold=0.0,
+        max_harmonics_per_f0=30,
         max_harmonic_freq_output=BBMaxFreq,
-        max_harmonic_freq_object=20,
+        max_harmonic_freq_object=10,
         log=False
     )
 
@@ -106,8 +106,18 @@ def process_chunk(chunk_data, chunk_id, progress_queue):
         window_size=frame_size,
         amp_dtype='uint8',
         phase_dtype='uint8',
+        scale_mode='log',
+        prediction_mode="delta"
+    )
+    
+    unpacker = HarmonicUnpacker(
+        sample_rate=48000,
+        window_size=frame_size,
+        amp_dtype='uint8',
+        phase_dtype='uint8',
         scale_mode='log'
     )
+   
 
     for i in range(0, len(chunk_data), hop_size):
         hop_array = chunk_data[i:i + hop_size]
@@ -170,7 +180,7 @@ def process_chunk(chunk_data, chunk_id, progress_queue):
         packedPS = pack_stereo_metadata(pan_values, ipd_values, ic_values, 0, 0, 0, len(stereo_profile))
 
         harmonic_chunk = extractor.process_chunk(mono_audio_unwindowed)
-        encoded = packer_compact.pack_chunk(harmonic_chunk)
+        #encoded = packer_compact.pack_chunk(harmonic_chunk)
 
         # ==================== DECODER SIDE ====================
         if dynamic_coding:
@@ -178,7 +188,8 @@ def process_chunk(chunk_data, chunk_id, progress_queue):
             if useSBR:
                 SBRdecoder.set_freq(BBMaxFreq, min(max_freq_mid, MaxFreq), SBRPoins)
 
-        decoded_objects = packer_compact.unpack_chunk(encoded)
+        #decoded_objects = unpacker.unpack_chunk(encoded)
+        decoded_objects = harmonic_chunk
         bb_audio = generator.process_chunk(decoded_objects)
 
         max_abs_val = np.max(np.abs(bb_audio))
@@ -286,8 +297,8 @@ def progress_monitor(progress_queue, tracker, stop_event):
 
 
 def main():
-    win = wave.open(r"C:\Users\sansw\Desktop\sample.wav", "rb")
-    wout = wave.open(r"C:\Users\sansw\Desktop\output4.wav", "wb")
+    win = wave.open(r"sample.wav", "rb")
+    wout = wave.open(r"output.endec2.wav", "wb")
     wout.setnchannels(2)
     wout.setsampwidth(2)
     wout.setframerate(48000)
@@ -299,9 +310,9 @@ def main():
     win.close()
 
     # Split into chunks (with overlap for boundary handling)
-    num_processes = 4  # Adjust based on your CPU cores
+    num_processes = 50  # Adjust based on your CPU cores
     chunk_size = len(audio_data) // num_processes
-    overlap_size = 1024  # One frame overlap for continuity
+    overlap_size = 2048  # One frame overlap for continuity
 
     chunks = []
     for i in range(num_processes):

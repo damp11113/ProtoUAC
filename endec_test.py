@@ -41,10 +41,10 @@ def process_chunk(chunk_data, chunk_id, progress_queue):
     """Process a single chunk of audio data in a separate process"""
     BBMaxFreq = 8000
     MaxFreq = 20000
-    SBRPoins = 32
+    SBRPoins = 64
     PSminFreq = 150
     PSmaxFreq = 12000
-    PSpoints = 320
+    PSpoints = 520
 
     frame_size = 1024 * 2
 
@@ -296,8 +296,8 @@ def progress_monitor(progress_queue, tracker, stop_event):
 
 
 def main():
-    win = wave.open(r"C:\Users\sansw\Desktop\sample.wav", "rb")
-    wout = wave.open(r"C:\Users\sansw\Desktop\output4.wav", "wb")
+    win = wave.open(r"sample.wav", "rb")
+    wout = wave.open(r"output.endec.wav", "wb")
     wout.setnchannels(2)
     wout.setsampwidth(2)
     wout.setframerate(48000)
@@ -309,7 +309,7 @@ def main():
     win.close()
 
     # Split into chunks (with overlap for boundary handling)
-    num_processes = 4  # Adjust based on your CPU cores
+    num_processes = 50  # Adjust based on your CPU cores
     chunk_size = len(audio_data) // num_processes
     overlap_size = 1024  # One frame overlap for continuity
 

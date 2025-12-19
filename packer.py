@@ -608,24 +608,233 @@ def dequantize_coefficients(quantized, scale):
     """
     return quantized.astype(np.float32) * scale
 
+import struct
+import math
+import numpy as np
+
+
 class HarmonicPacker:
     """
-    Enhanced harmonic packer with multiple encoding options.
-
-    Data types:
-    - 'uint8': 0-255 (1 byte per value)
-    - 'uint16': 0-65535 (2 bytes per value)
-    - 'int8': -128 to 127 (1 byte per value)
-    - 'int16': -32768 to 32767 (2 bytes per value)
-    - 'float16': half precision (2 bytes per value)
-    - 'float32': single precision (4 bytes per value)
-
-    Scaling modes:
-    - 'linear': Direct linear scaling
-    - 'log': Logarithmic scaling (better for audio amplitudes)
-    - 'db': Decibel scaling (perceptually accurate)
+    Packs harmonic data with predictive compression.
+    
+    Prediction modes:
+    - 'none': No prediction
+    - 'delta': Store differences from previous frame
+    - 'linear': Linear extrapolation from previous 2 frames
     """
+    
+    def __init__(self, sample_rate, window_size,
+                 amp_dtype='uint8', phase_dtype='uint8',
+                 scale_mode='log', min_amp_db=-80,
+                 prediction_mode='delta'):
+        self.sr = sample_rate
+        self.win = window_size
+        self.bin_size = sample_rate / window_size
+        self.amp_dtype = amp_dtype
+        self.phase_dtype = phase_dtype
+        self.scale_mode = scale_mode
+        self.min_amp_db = min_amp_db
+        self.min_amp_linear = 10 ** (min_amp_db / 20)
+        self.prediction_mode = prediction_mode
+        
+        # Store previous frames for prediction
+        self.prev_frames = []
+        
+        self.dtype_formats = {
+            'uint8': 'B', 'uint16': 'H', 'int8': 'b', 
+            'int16': 'h', 'float16': None, 'float32': 'f'
+        }
+        
+        self.dtype_ranges = {
+            'uint8': (0, 255), 'uint16': (0, 65535),
+            'int8': (-128, 127), 'int16': (-32768, 32767),
+            'float16': (None, None), 'float32': (None, None)
+        }
+    
+    def _encode_amplitude(self, amp, max_amp):
+        """Encode amplitude based on data type and scale mode."""
+        if self.amp_dtype in ['float16', 'float32']:
+            return amp
+        
+        if max_amp < self.min_amp_linear:
+            max_amp = self.min_amp_linear
+        
+        if self.scale_mode == 'linear':
+            norm = amp / max_amp
+        elif self.scale_mode == 'log':
+            amp_safe = max(amp, self.min_amp_linear)
+            max_safe = max(max_amp, self.min_amp_linear)
+            try:
+                norm = math.log(amp_safe / self.min_amp_linear) / math.log(max_safe / self.min_amp_linear)
+            except (ZeroDivisionError, ValueError):
+                norm = 0.0
+            norm = np.clip(norm, 0, 1)
+        elif self.scale_mode == 'db':
+            amp_safe = max(amp, self.min_amp_linear)
+            max_safe = max(max_amp, self.min_amp_linear)
+            amp_db = 20 * math.log10(amp_safe)
+            max_db = 20 * math.log10(max_safe)
+            norm = (amp_db - self.min_amp_db) / (max_db - self.min_amp_db)
+            norm = np.clip(norm, 0, 1)
+        else:
+            norm = amp / max_amp
+        
+        vmin, vmax = self.dtype_ranges[self.amp_dtype]
+        return int(norm * (vmax - vmin) + vmin)
+    
+    def _encode_phase(self, phase):
+        """Encode phase to selected data type."""
+        if self.phase_dtype in ['float16', 'float32']:
+            return phase
+        
+        # Normalize phase from [-π, π] to [0, 1]
+        norm = (phase + math.pi) / (2 * math.pi)
+        vmin, vmax = self.dtype_ranges[self.phase_dtype]
+        return int(norm * (vmax - vmin) + vmin)
+    
+    def _pack_value(self, value, dtype):
+        """Pack a single value according to its data type."""
+        if dtype == 'float16':
+            return np.float16(value).tobytes()
+        elif dtype == 'float32':
+            return struct.pack('f', value)
+        else:
+            fmt = self.dtype_formats[dtype]
+            return struct.pack(fmt, value)
+    
+    def _predict_frame(self, current_frame):
+        """Generate prediction for current frame based on history."""
+        if self.prediction_mode == 'none' or len(self.prev_frames) == 0:
+            return None
+        
+        if self.prediction_mode == 'delta':
+            # Predict using previous frame
+            return self.prev_frames[-1]
+        
+        elif self.prediction_mode == 'linear' and len(self.prev_frames) >= 2:
+            # Linear extrapolation from last 2 frames
+            prev1 = self.prev_frames[-1]
+            prev2 = self.prev_frames[-2]
+            
+            predicted = []
+            for i, obj in enumerate(current_frame):
+                if i < len(prev1) and i < len(prev2):
+                    # Match by frequency
+                    p1 = prev1[i]
+                    p2 = prev2[i]
+                    
+                    if abs(p1['freq'] - obj['freq']) < self.bin_size * 2:
+                        pred_harms = []
+                        for j in range(min(len(p1['harmonics']), len(obj['harmonics']))):
+                            h1 = p1['harmonics'][j]
+                            h2 = p2['harmonics'][j]
+                            
+                            # Extrapolate amplitude and phase
+                            pred_amp = 2 * h1['amp'] - h2['amp']
+                            pred_phase = 2 * h1['phase'] - h2['phase']
+                            
+                            pred_harms.append({
+                                'amp': max(pred_amp, 0),
+                                'phase': pred_phase
+                            })
+                        
+                        predicted.append({
+                            'freq': obj['freq'],
+                            'harmonics': pred_harms
+                        })
+                        continue
+                
+                predicted.append(None)
+            
+            return predicted
+        
+        # Fallback to delta
+        return self.prev_frames[-1] if self.prev_frames else None
+    
+    def _compute_residual(self, current, predicted):
+        """Compute residual between current and predicted frame."""
+        if predicted is None:
+            return current, False
+        
+        residuals = []
+        has_prediction = False
+        
+        for i, obj in enumerate(current):
+            pred = predicted[i] if i < len(predicted) else None
+            
+            if pred and abs(pred['freq'] - obj['freq']) < self.bin_size * 2:
+                # Compute residual
+                res_harms = []
+                for j, h in enumerate(obj['harmonics']):
+                    if j < len(pred['harmonics']):
+                        ph = pred['harmonics'][j]
+                        res_harms.append({
+                            'amp': h['amp'] - ph['amp'],
+                            'phase': h['phase'] - ph['phase']
+                        })
+                        has_prediction = True
+                    else:
+                        res_harms.append(h)
+                
+                residuals.append({
+                    'freq': obj['freq'],
+                    'harmonics': res_harms
+                })
+            else:
+                residuals.append(obj)
+        
+        return residuals, has_prediction
+    
+    def pack_chunk(self, harmonic_objects, use_prediction=True):
+        """Pack harmonic objects into bytes with optional prediction."""
+        prediction = self._predict_frame(harmonic_objects) if use_prediction else None
+        residuals, has_pred = self._compute_residual(harmonic_objects, prediction)
+        
+        # Header: prediction flag (1 byte)
+        payload = bytearray([1 if has_pred else 0])
+        
+        for obj in residuals:
+            freq = obj["freq"]
+            harms = obj["harmonics"]
+            hcount = len(harms)
+            
+            freq_bin = int(freq / self.bin_size)
+            max_amp_obj = max(abs(h['amp']) for h in harms) if harms else self.min_amp_linear
+            
+            # Pack header: freq_bin (uint16), hcount (uint8), scale_factor (float32)
+            payload += struct.pack('<HB', freq_bin, hcount)
+            payload += struct.pack('f', max_amp_obj)
+            
+            # Pack each harmonic
+            for h in harms:
+                encoded_amp = self._encode_amplitude(abs(h["amp"]), max_amp_obj)
+                encoded_phase = self._encode_phase(h["phase"])
+                
+                payload += self._pack_value(encoded_amp, self.amp_dtype)
+                payload += self._pack_value(encoded_phase, self.phase_dtype)
+        
+        # Update history
+        self.prev_frames.append(harmonic_objects)
+        if len(self.prev_frames) > 2:
+            self.prev_frames.pop(0)
+        
+        return bytes(payload)
+    
+    def reset(self):
+        """Reset prediction history."""
+        self.prev_frames = []
+    
+    def get_bytes_per_harmonic(self):
+        """Calculate bytes per harmonic for current configuration."""
+        amp_size = 2 if self.amp_dtype == 'float16' else struct.calcsize(self.dtype_formats.get(self.amp_dtype, 'B'))
+        phase_size = 2 if self.phase_dtype == 'float16' else struct.calcsize(self.dtype_formats.get(self.phase_dtype, 'B'))
+        return amp_size + phase_size
 
+class HarmonicUnpacker:
+    """
+    Unpacks harmonic data with predictive decompression.
+    """
+    
     def __init__(self, sample_rate, window_size,
                  amp_dtype='uint8', phase_dtype='uint8',
                  scale_mode='log', min_amp_db=-80):
@@ -637,72 +846,29 @@ class HarmonicPacker:
         self.scale_mode = scale_mode
         self.min_amp_db = min_amp_db
         self.min_amp_linear = 10 ** (min_amp_db / 20)
-
-        # Define packing formats
+        
+        # Store previous frames for prediction reconstruction
+        self.prev_frames = []
+        
         self.dtype_formats = {
-            'uint8': 'B',
-            'uint16': 'H',
-            'int8': 'b',
-            'int16': 'h',
-            'float16': None,  # special handling
-            'float32': 'f'
+            'uint8': 'B', 'uint16': 'H', 'int8': 'b',
+            'int16': 'h', 'float16': None, 'float32': 'f'
         }
-
-        # Define value ranges
+        
         self.dtype_ranges = {
-            'uint8': (0, 255),
-            'uint16': (0, 65535),
-            'int8': (-128, 127),
-            'int16': (-32768, 32767),
-            'float16': (None, None),  # no quantization needed
-            'float32': (None, None)  # no quantization needed
+            'uint8': (0, 255), 'uint16': (0, 65535),
+            'int8': (-128, 127), 'int16': (-32768, 32767),
+            'float16': (None, None), 'float32': (None, None)
         }
-
-    def _encode_amplitude(self, amp, max_amp):
-        """Encode amplitude based on selected data type and scale mode."""
-        if self.amp_dtype in ['float16', 'float32']:
-            # Direct float storage, no quantization
-            return amp
-
-        # Normalize
-        if max_amp < self.min_amp_linear:
-            max_amp = self.min_amp_linear
-
-        if self.scale_mode == 'linear':
-            norm = amp / max_amp
-        elif self.scale_mode == 'log':
-            # Log scale: better resolution at low amplitudes
-            amp_safe = max(amp, self.min_amp_linear)
-            max_safe = max(max_amp, self.min_amp_linear)
-            try:
-                norm = math.log(amp_safe / self.min_amp_linear) / math.log(max_safe / self.min_amp_linear)
-            except ZeroDivisionError:
-                norm = 0.0
-
-            norm = np.clip(norm, 0, 1)
-        elif self.scale_mode == 'db':
-            # Decibel scale
-            amp_safe = max(amp, self.min_amp_linear)
-            max_safe = max(max_amp, self.min_amp_linear)
-            amp_db = 20 * math.log10(amp_safe)
-            max_db = 20 * math.log10(max_safe)
-            norm = (amp_db - self.min_amp_db) / (max_db - self.min_amp_db)
-            norm = np.clip(norm, 0, 1)
-        else:
-            norm = amp / max_amp
-
-        # Quantize to integer range
-        vmin, vmax = self.dtype_ranges[self.amp_dtype]
-        return int(norm * (vmax - vmin) + vmin)
-
+    
     def _decode_amplitude(self, encoded_val, max_amp):
         """Decode amplitude from encoded value."""
         if self.amp_dtype in ['float16', 'float32']:
             return encoded_val
-
+        
         vmin, vmax = self.dtype_ranges[self.amp_dtype]
         norm = (encoded_val - vmin) / (vmax - vmin)
-
+        
         if self.scale_mode == 'linear':
             return norm * max_amp
         elif self.scale_mode == 'log':
@@ -716,37 +882,16 @@ class HarmonicPacker:
             return 10 ** (amp_db / 20)
         else:
             return norm * max_amp
-
-    def _encode_phase(self, phase):
-        """Encode phase to selected data type."""
-        if self.phase_dtype in ['float16', 'float32']:
-            return phase
-
-        # Normalize phase from [-π, π] to [0, 1]
-        norm = (phase + math.pi) / (2 * math.pi)
-
-        vmin, vmax = self.dtype_ranges[self.phase_dtype]
-        return int(norm * (vmax - vmin) + vmin)
-
+    
     def _decode_phase(self, encoded_val):
         """Decode phase from encoded value."""
         if self.phase_dtype in ['float16', 'float32']:
             return encoded_val
-
+        
         vmin, vmax = self.dtype_ranges[self.phase_dtype]
         norm = (encoded_val - vmin) / (vmax - vmin)
         return norm * (2 * math.pi) - math.pi
-
-    def _pack_value(self, value, dtype):
-        """Pack a single value according to its data type."""
-        if dtype == 'float16':
-            return np.float16(value).tobytes()
-        elif dtype == 'float32':
-            return struct.pack('f', value)
-        else:
-            fmt = self.dtype_formats[dtype]
-            return struct.pack(fmt, value)
-
+    
     def _unpack_value(self, data, pos, dtype):
         """Unpack a single value and return (value, new_position)."""
         if dtype == 'float16':
@@ -760,76 +905,94 @@ class HarmonicPacker:
             size = struct.calcsize(fmt)
             value = struct.unpack_from(fmt, data, pos)[0]
             return value, pos + size
-
-    def pack_chunk(self, harmonic_objects):
-        """Pack harmonic objects into bytes."""
-        payload = bytearray()
-
-        for obj in harmonic_objects:
-            freq = obj["freq"]
-            harms = obj["harmonics"]
-            hcount = len(harms)
-
-            # Convert frequency to bin
-            freq_bin = int(freq / self.bin_size)
-
-            # Find max amplitude for scaling
-            max_amp_obj = max(h['amp'] for h in harms) if harms else self.min_amp_linear
-
-            # Pack header: freq_bin (uint16), hcount (uint8), scale_factor (float32)
-            payload += struct.pack('<HB', freq_bin, hcount)
-            payload += struct.pack('f', max_amp_obj)
-
-            # Pack each harmonic
-            for h in harms:
-                encoded_amp = self._encode_amplitude(h["amp"], max_amp_obj)
-                encoded_phase = self._encode_phase(h["phase"])
-
-                payload += self._pack_value(encoded_amp, self.amp_dtype)
-                payload += self._pack_value(encoded_phase, self.phase_dtype)
-
-        return bytes(payload)
-
+    
+    def _reconstruct_from_residual(self, residuals, has_prediction):
+        """Reconstruct full frame from residuals using prediction."""
+        if not has_prediction or len(self.prev_frames) == 0:
+            return residuals
+        
+        predicted = self.prev_frames[-1]
+        reconstructed = []
+        
+        for i, res_obj in enumerate(residuals):
+            pred = predicted[i] if i < len(predicted) else None
+            
+            if pred and abs(pred['freq'] - res_obj['freq']) < self.bin_size * 2:
+                # Add residuals to prediction
+                rec_harms = []
+                for j, res_h in enumerate(res_obj['harmonics']):
+                    if j < len(pred['harmonics']):
+                        ph = pred['harmonics'][j]
+                        rec_harms.append({
+                            'amp': res_h['amp'] + ph['amp'],
+                            'phase': res_h['phase'] + ph['phase']
+                        })
+                    else:
+                        rec_harms.append(res_h)
+                
+                reconstructed.append({
+                    'freq': res_obj['freq'],
+                    'n_harmonic': len(rec_harms),
+                    'main_amp': rec_harms[0]['amp'] if rec_harms else 0.0,
+                    'harmonics': rec_harms
+                })
+            else:
+                reconstructed.append({
+                    'freq': res_obj['freq'],
+                    'n_harmonic': len(res_obj['harmonics']),
+                    'main_amp': res_obj['harmonics'][0]['amp'] if res_obj['harmonics'] else 0.0,
+                    'harmonics': res_obj['harmonics']
+                })
+        
+        return reconstructed
+    
     def unpack_chunk(self, data):
         """Unpack bytes back into harmonic objects."""
         pos = 0
         length = len(data)
+        
+        # Read prediction flag
+        has_prediction = data[pos] == 1
+        pos += 1
+        
         objects = []
-
+        
         while pos < length:
             # Read header
             freq_bin, hcount = struct.unpack_from('<HB', data, pos)
             pos += 3
-
+            
             max_amp_obj = struct.unpack_from('f', data, pos)[0]
             pos += 4
-
+            
             freq = freq_bin * self.bin_size
             harmonics = []
-
+            
             # Read harmonics
             for _ in range(hcount):
                 encoded_amp, pos = self._unpack_value(data, pos, self.amp_dtype)
                 encoded_phase, pos = self._unpack_value(data, pos, self.phase_dtype)
-
+                
                 amp = self._decode_amplitude(encoded_amp, max_amp_obj)
                 phase = self._decode_phase(encoded_phase)
-
+                
                 harmonics.append({'amp': amp, 'phase': phase})
-
-            obj = {
+            
+            objects.append({
                 "freq": freq,
-                "n_harmonic": hcount,
-                "main_amp": harmonics[0]["amp"] if harmonics else 0.0,
                 "harmonics": harmonics
-            }
-            objects.append(obj)
-
-        return objects
-
-    def get_bytes_per_harmonic(self):
-        """Calculate bytes per harmonic for current configuration."""
-        amp_size = 2 if self.amp_dtype == 'float16' else struct.calcsize(self.dtype_formats.get(self.amp_dtype, 'B'))
-        phase_size = 2 if self.phase_dtype == 'float16' else struct.calcsize(
-            self.dtype_formats.get(self.phase_dtype, 'B'))
-        return amp_size + phase_size
+            })
+        
+        # Reconstruct from residuals if prediction was used
+        reconstructed = self._reconstruct_from_residual(objects, has_prediction)
+        
+        # Update history
+        self.prev_frames.append(reconstructed)
+        if len(self.prev_frames) > 2:
+            self.prev_frames.pop(0)
+        
+        return reconstructed
+    
+    def reset(self):
+        """Reset prediction history."""
+        self.prev_frames = []
