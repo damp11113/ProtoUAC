@@ -25,3 +25,6 @@ Bitrate Mode
 - VBR 🟨
 - CVBR
 - ABR
+
+# Demo
+https://www.youtube.com/watch?v=VFwbHifd4kU
