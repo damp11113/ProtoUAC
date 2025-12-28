@@ -230,7 +230,7 @@ if __name__ == '__main__':
         'min_f0_freq': 20.0,
         'max_f0_freq': 16000.0,
         'peak_threshold': 0.0,
-        'max_harmonics_per_f0': 30,
+        'max_harmonics_per_f0': 10,
         'max_harmonic_freq_output': 16000.0,
         'max_harmonic_freq_object': 10,
     }

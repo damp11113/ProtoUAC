@@ -52,6 +52,8 @@ def process_chunk(chunk_data, sr, frame_size, hop_size, encoder_params, decoder_
     processed_frames = 0
     avgbitrate = []
     
+    pnbytes = 0.5
+    
     for i in range(0, n_samples, hop_size):
         frame_end = min(i + frame_size, n_samples)
         
@@ -75,14 +77,14 @@ def process_chunk(chunk_data, sr, frame_size, hop_size, encoder_params, decoder_
         # Analysis: Extract parameters from stereo
         harmonic_sd, impulse_sd = encoder.encode(stereo_frame)
 
-        Hpacked = PHSCpackObj(harmonic_sd, nbytes=1)
+        Hpacked = PHSCpackObj(harmonic_sd, nbytes=pnbytes)
 
-        Ipacked = MPSpackObj(impulse_sd, encoder.impulse_encoder.min_freq, encoder.impulse_encoder.max_freq, encoder.impulse_encoder.freq_points, nbytes=1)
+        Ipacked = MPSpackObj(impulse_sd, encoder.impulse_encoder.min_freq, encoder.impulse_encoder.max_freq, encoder.impulse_encoder.freq_points, nbytes=pnbytes)
 
         avgbitrate.append(((len(Hpacked) + len(Ipacked)) * 8) * (sr / frame_size))
 
         # decoder side
-        decodedH = PHSCunpackObj(Hpacked, nbytes=1)
+        decodedH = PHSCunpackObj(Hpacked, nbytes=pnbytes)
         decodedI, _, _, _ = MPSunpackObj(Ipacked)
 
         smoothedH = smoother_phsc.smooth_phsc_objects(decodedH)
@@ -127,7 +129,7 @@ def main():
     encoder_params = {
         'min_freq': 120.0,
         'max_freq': 14000,
-        'imp_point': 5,
+        'imp_point': 8,
         'log_scale': True,
         'hps_L_h': 0.1,
         'hps_L_p': 1000,
@@ -139,7 +141,7 @@ def main():
     decoder_params = {
         'min_freq': 120.0,
         'max_freq': 14000,
-        'imp_point': 5,
+        'imp_point': 8,
         'log_scale': True,
         'hps_L_h': 0.1,
         'hps_L_p': 1000,

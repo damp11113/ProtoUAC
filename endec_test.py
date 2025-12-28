@@ -1,4 +1,3 @@
-import math
 import traceback
 import wave
 import numpy as np
@@ -309,7 +308,7 @@ def main():
     win.close()
 
     # Split into chunks (with overlap for boundary handling)
-    num_processes = 50  # Adjust based on your CPU cores
+    num_processes = 8  # Adjust based on your CPU cores
     chunk_size = len(audio_data) // num_processes
     overlap_size = 1024  # One frame overlap for continuity
 

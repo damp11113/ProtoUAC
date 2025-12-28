@@ -14,13 +14,18 @@ class SBREncoder:
             floor_db: float = -75.0,
             pre_echo_threshold: float = 10.0,
             energy_threshold_db: float = -60.0,
-            flat_band_threshold: float = 0.75
+            flat_band_threshold: float = 0.75,
+            forcing=0
     ):
+        """
+        forcing: 0 = auto, 1 = noise only, 2 = use exist audio for sbr
+        """
         self.sample_rate = sample_rate
         self.floor_db = floor_db
         self.pre_echo_threshold = pre_echo_threshold
         self.energy_threshold_db = energy_threshold_db
         self.flat_band_threshold = flat_band_threshold
+        self.forcing = forcing
 
         # Initialize frequency bands
         self.set_freq(min_freq, max_freq, freq_points)
@@ -120,7 +125,7 @@ class SBREncoder:
                 if energy_db < self.energy_threshold_db:
                     energy_db = self.floor_db
 
-                if adaptive:
+                if adaptive and self.forcing == 0:
                     band_power = np.abs(band_mag) ** 2
                     # Avoid log(0)
                     band_power = np.maximum(band_power, 1e-12)
@@ -140,7 +145,10 @@ class SBREncoder:
                     else:
                         isNoise = False
                 else:
-                    isNoise = False
+                    if self.forcing == 1: # noise
+                        isNoise = True
+                    else:
+                        isNoise = False
             else:
                 energy_db = self.floor_db
                 isNoise = False
@@ -318,12 +326,26 @@ class SBRDecoder:
         Returns:
             High-frequency signal as float32
         """
+        # if baseband_mono = None then create silent sample for processing
+        if baseband_mono is None:
+            frame_length = self.chunk_size
+            baseband_mono = np.zeros(frame_length, dtype=np.float32)
+            infloat = True 
+
         if infloat:
             audio_float = baseband_mono
         else:
             audio_float = baseband_mono.astype(np.float32) / 32768.0
 
         frame_length = len(audio_float)
+
+        # if should_use_noise = True then apply True all or if false apply false
+        if should_use_noises is True:
+            should_use_noises = [True] * len(band_energies)
+        elif should_use_noises is False:
+            should_use_noises = [False] * len(band_energies)
+
+        
 
         if not use_chunks or is_transient:
             return self._generate_single_frame(audio_float, band_energies, is_transient, should_use_noises)
