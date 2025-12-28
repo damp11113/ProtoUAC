@@ -7,6 +7,7 @@ Email to `contact@damp11113.xyz` for get STD_TEST file for testing this codec.
 # Technology
 - [MPS](https://github.com/damp11113/ProtoUAC/blob/UAC-E/parametric_coding.py) (Multiband Parametric Stereo)
 - [HPS](https://github.com/damp11113/ProtoUAC/blob/UAC-E/hps.py) (Hybrid Parametric Stereo)
+- [HBB](https://github.com/damp11113/ProtoUAC/blob/UAC-E/hbb.py) (Hybrid Baseband)
 - [PHSC](https://github.com/damp11113/ProtoUAC/blob/UAC-E/phsc.py) (Parametric Harmonic Stereo Coding)
 - [PHXC](https://github.com/damp11113/ProtoUAC/blob/UAC-E/phxc.py) (Parametric Harmonic eXtraction Coding)
 
