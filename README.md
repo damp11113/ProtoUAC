@@ -4,6 +4,12 @@ A Ultimate Audio Coding prototype in python. This codec is plan to use compressi
 
 Email to `contact@damp11113.xyz` for get STD_TEST file for testing this codec.
 
+# Technology
+- [MPS](https://github.com/damp11113/ProtoUAC/blob/UAC-E/parametric_coding.py) (Multiband Parametric Stereo)
+- [HPS](https://github.com/damp11113/ProtoUAC/blob/UAC-E/hps.py) (Hybrid Parametric Stereo)
+- [PHSC](https://github.com/damp11113/ProtoUAC/blob/UAC-E/phsc.py) (Parametric Harmonic Stereo Coding)
+- [PHXC](https://github.com/damp11113/ProtoUAC/blob/UAC-E/phxc.py) (Parametric Harmonic eXtraction Coding)
+
 # To Do
 Profiles
 - UAC-LC (Ultimate Audio Coding - Low Complex) 
@@ -25,3 +31,6 @@ Bitrate Mode
 - VBR 🟨
 - CVBR
 - ABR
+
+# Demo
+SBR + MPS: https://www.youtube.com/watch?v=VFwbHifd4kU
