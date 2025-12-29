@@ -321,12 +321,6 @@ class HarmonicStereoSynthesizer:
         left_out = mid + side_widened
         right_out = mid - side_widened
         
-        # Optional: Apply soft limiting to prevent clipping from extreme widening
-        max_val = max(np.max(np.abs(left_out)), np.max(np.abs(right_out)))
-        if max_val > 1.0:
-            left_out /= max_val
-            right_out /= max_val
-        
         return left_out, right_out
     
     def _icld_to_lr_gains(self, icld: float) -> Tuple[float, float]:

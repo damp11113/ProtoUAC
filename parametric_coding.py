@@ -254,7 +254,8 @@ class PSDecoder:
             max_freq: float = 20000.0,
             freq_points: int = 32,
             use_grouping: bool = False,
-            log_scale: bool = True
+            log_scale: bool = True,
+            stereo_width: float = 1.0
     ):
         """Initialize the stereo audio analyzer.
 
@@ -266,10 +267,12 @@ class PSDecoder:
             floor_db: Noise floor in dB (signals below this are ignored)
             use_grouping: If True, average over frequency bands
             log_scale: If True, use logarithmic frequency spacing (default)
+            stereo_width: Stereo width scaling factor
         """
         self.sample_rate = sample_rate
         self.use_grouping = use_grouping
         self.log_scale = log_scale
+        self.stereo_width = stereo_width
 
         # Pre-calculate target frequencies
         self.set_freq(min_freq, max_freq, freq_points)
@@ -288,6 +291,23 @@ class PSDecoder:
         else:
             self.target_freqs = np.linspace(min_freq, max_freq, freq_points)
 
+    def _apply_stereo_width(self, left: np.ndarray, right: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Apply stereo width expansion using Mid-Side processing.
+        This is the standard algorithm used in DAWs.
+        """
+        # Convert L/R to Mid-Side
+        mid = (left + right) / 2.0
+        side = (left - right) / 2.0
+        
+        # Apply width to side signal
+        side_widened = side * self.stereo_width
+        
+        # Convert back to L/R
+        left_out = mid + side_widened
+        right_out = mid - side_widened
+        return left_out, right_out
+        
     def apply(
             self,
             mono_audio: np.ndarray,
@@ -366,6 +386,9 @@ class PSDecoder:
 
         left = np.fft.irfft(left_fft, n=len(mono_float))
         right = np.fft.irfft(right_fft, n=len(mono_float))
+
+        # Apply stereo width
+        left, right = self._apply_stereo_width(left, right)
 
         stereo = np.column_stack([left, right])
 
