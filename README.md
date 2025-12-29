@@ -11,6 +11,14 @@ Email to `contact@damp11113.xyz` for get STD_TEST file for testing this codec.
 - [PHSC](https://github.com/damp11113/ProtoUAC/blob/UAC-E/phsc.py) (Parametric Harmonic Stereo Coding)
 - [PHXC](https://github.com/damp11113/ProtoUAC/blob/UAC-E/phxc.py) (Parametric Harmonic eXtraction Coding)
 
+# Stereo mode
+- Dual
+- Mid/Side
+- Parametric Stereo
+  - MPS (Standard): Best for high precision stereo
+  - PHSC: Best for dialogue or voice
+  - HPS: Best for music in low bitrate
+
 # To Do
 Profiles
 - UAC-LC (Ultimate Audio Coding - Low Complex) 
