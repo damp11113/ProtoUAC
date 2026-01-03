@@ -4,8 +4,10 @@ from functools import partial
 from packer import HarmonicPacker, HarmonicUnpacker
 from phxc import HarmonicExtractor, HarmonicGenerator
 import numpy as np
+past_encoded_bytes = b""
 
 def process_single_chunk(args, extractor_params, packer_params):
+    global past_encoded_bytes
     """
     Process a single chunk in a separate process.
     Returns the chunk index and encoded data.
@@ -23,7 +25,8 @@ def process_single_chunk(args, extractor_params, packer_params):
         peak_threshold=extractor_params['peak_threshold'],
         max_harmonics_per_f0=extractor_params['max_harmonics_per_f0'],
         max_harmonic_freq_output=extractor_params['max_harmonic_freq_output'],
-        max_harmonic_freq_object=extractor_params['max_harmonic_freq_object']
+        max_harmonic_freq_object=extractor_params['max_harmonic_freq_object'],
+        log=True
     )
     
     # Create packer for this process
@@ -38,7 +41,11 @@ def process_single_chunk(args, extractor_params, packer_params):
     
     # Process the chunk
     harmonic_chunk = extractor.process_chunk(chunk_data)
-    encoded = packer.pack_chunk(harmonic_chunk)
+    try:
+        encoded = packer.pack_chunk(harmonic_chunk)
+        past_encoded_bytes = encoded
+    except:
+        encoded = past_encoded_bytes
     
     return chunk_idx, encoded, len(harmonic_chunk)
 

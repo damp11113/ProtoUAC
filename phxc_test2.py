@@ -1,12 +1,12 @@
-from phsc import HarmonicStereoExtractor, HarmonicStereoSynthesizer
 import soundfile as sf
 import logging
 import numpy as np
+from phxc import HarmonicExtractor, HarmonicGenerator
+from phxc_packer import packObj, unpackObj
+from packer import HarmonicPacker, HarmonicUnpacker
 from multiprocessing import Pool, cpu_count, Manager
 from functools import partial
 from tqdm import tqdm
-from phsc_packer import packObj as PHSCpackObj, unpackObj as PHSCunpackObj
-from hps_smoother import ParameterSmoother
 
 # create log with date info
 logging.basicConfig(
@@ -15,89 +15,87 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-def process_chunk(chunk_data, sr, frame_size, hop_size, encoder_params, decoder_params, progress_dict):
+def process_chunk(chunk_data, sr, frame_size, hop_size, progress_dict):
     chunk_idx, stereo_chunk, mono_chunk, start_idx = chunk_data
     
-    # Initialize progress for this chunk
     progress_dict[chunk_idx] = 0
     
-    # Initialize encoder and decoder in this process
-    encoder = HarmonicStereoExtractor(
+    extractor = HarmonicExtractor(
         sample_rate=sr,
         window_size=frame_size,
         hop_size=hop_size,
-        min_f0_freq=120,
+        min_f0_freq=20,
         max_f0_freq=16000,
         peak_threshold=0.0,
-        max_harmonics_per_f0=1,
-        max_harmonic_freq_object=1,
-        log=True
-    )
-    
-    decoder = HarmonicStereoSynthesizer(
-        sample_rate=sr,
-        window_size=frame_size,
-        hop_size=hop_size,
-        stereo_width=1.5
+        max_harmonics_per_f0=10,
+        max_harmonic_freq_output=16000,
+        max_harmonic_freq_object=10
     )
 
-    smoother_phsc = ParameterSmoother(alpha=0.5, method='ema')
+    packer = HarmonicPacker(
+        sample_rate=sr,
+        window_size=frame_size,
+        amp_dtype="uint8",
+        phase_dtype="uint8",
+        scale_mode="log",
+        prediction_mode="delta"
+    )
+
+    pnbytes = 2
+    highDetailMode = True
+
+    generator = HarmonicGenerator(
+        sample_rate=sr,
+        window_size=frame_size,
+        hop_size=hop_size
+    )
+
+    unpacker = HarmonicUnpacker(
+        sample_rate=sr,
+        window_size=frame_size,
+        amp_dtype="uint8",
+        phase_dtype="uint8",
+        scale_mode="log",
+    )
+
+    n_samples = len(mono_chunk)
+    output = np.zeros(n_samples, dtype=np.float32)
+    hann_window = np.hanning(frame_size)[:, np.newaxis].reshape(-1)
+    prev_overlap = np.zeros(hop_size, dtype=np.float32)
     
-    # Process this chunk
-    n_samples = len(stereo_chunk)
-    output = np.zeros_like(stereo_chunk)
-    hann_window = np.hanning(frame_size)[:, np.newaxis]
-    prev_overlap = np.zeros((hop_size, 2), dtype=np.float32)
-    
-    # Calculate total frames for progress tracking
+    # Track frames for progress
     total_frames = (n_samples + hop_size - 1) // hop_size
     processed_frames = 0
-    avgbitrate = []
     
-    pnbytes = 0.5
+    # Initialize overlap buffer based on actual decoder output size
+    # We'll determine the size after the first decode to be safe
+    avgbitrate = []
     
     for i in range(0, n_samples, hop_size):
         frame_end = min(i + frame_size, n_samples)
-        
-        # Get current stereo and mono frames
-        stereo_frame = stereo_chunk[i:frame_end]
         mono_frame = mono_chunk[i:frame_end]
         
-        # Pad if needed
-        if len(stereo_frame) < frame_size:
-            stereo_frame = np.pad(
-                stereo_frame,
-                ((0, frame_size - len(stereo_frame)), (0, 0)),
-                mode='constant'
-            )
-            mono_frame = np.pad(
-                mono_frame,
-                (0, frame_size - len(mono_frame)),
-                mode='constant'
-            )
+        if len(mono_frame) < frame_size:
+            mono_frame = np.pad(mono_frame, (0, frame_size - len(mono_frame)), mode='constant')
         
-        # Analysis: Extract parameters from stereo
-        harmonic_sd = encoder.process_chunk(
-            stereo_frame[:, 0],
-            stereo_frame[:, 1]
-        )
+        # Analysis and Synthesis
+        harmonic_sd = extractor.process_chunk(mono_frame)
 
-        Hpacked = PHSCpackObj(harmonic_sd, nbytes=pnbytes)
+        if highDetailMode:
+            packed = packer.pack_chunk(harmonic_sd)
+        else:
+            packed = packObj(harmonic_sd, pnbytes)
 
-        avgbitrate.append((len(Hpacked) * 8) * (sr / frame_size))
+        avgbitrate.append((len(packed) * 8) * (sr / frame_size))
 
         # decoder side
-        decodedH = PHSCunpackObj(Hpacked, nbytes=pnbytes)
+        if highDetailMode:
+            uharmonic_sd = unpacker.unpack_chunk(packed)
+        else:
+            uharmonic_sd = unpackObj(packed, pnbytes)
 
-        smoothedH = smoother_phsc.smooth_phsc_objects(decodedH)
+        reconstructed = generator.process_chunk(uharmonic_sd)
         
-        # Synthesis: Apply parameters to mono
-        rh_l, rh_r = decoder.process_chunk(
-            mono_frame,
-            smoothedH,
-            False
-        )
-        reconstructed = np.column_stack([rh_l, rh_r])
         reconstructed *= hann_window
         
         # Overlap-add
@@ -115,7 +113,7 @@ def process_chunk(chunk_data, sr, frame_size, hop_size, encoder_params, decoder_
         processed_frames += 1
         progress_dict[chunk_idx] = int((processed_frames / total_frames) * 100)
     
-    logging.info(f"Chunk {chunk_idx} completed (samples {start_idx} to {start_idx + n_samples})")
+    logging.info(f"Chunk {chunk_idx} completed")
     print(f"avg bitrate is", np.mean(avgbitrate)/1000, "kbps")
     progress_dict[chunk_idx] = 100
     
@@ -128,32 +126,10 @@ def main():
     mono_audio = np.mean(stereo_audio, axis=1)
     
     # Parameters
-    frame_size = 1024 * 3
+    frame_size = 1024 * 2
     hop_size = frame_size // 2
     
     # Encoder parameters
-    encoder_params = {
-        'min_freq': 120.0,
-        'max_freq': 14000,
-        'imp_point': 8,
-        'log_scale': True,
-        'hps_L_h': 0.1,
-        'hps_L_p': 1000,
-        'max_harmonic_freq_object': 7,
-        'max_harmonics_per_f0': 3
-    }
-    
-    # Decoder parameters
-    decoder_params = {
-        'min_freq': 120.0,
-        'max_freq': 14000,
-        'imp_point': 8,
-        'log_scale': True,
-        'hps_L_h': 0.1,
-        'hps_L_p': 1000,
-        'stereo_width': 1.5
-    }
-    
     # Determine number of processes
     n_processes = max(1, cpu_count() - 1)  # Leave one CPU free
     logging.info(f"Using {n_processes} processes")
@@ -193,8 +169,6 @@ def main():
         sr=sr,
         frame_size=frame_size,
         hop_size=hop_size,
-        encoder_params=encoder_params,
-        decoder_params=decoder_params,
         progress_dict=progress_dict
     )
     
@@ -231,7 +205,7 @@ def main():
     
     # Merge results with crossfade for smooth transitions
     logging.info("Merging processed chunks with crossfade...")
-    output = np.zeros_like(stereo_audio)
+    output = np.zeros_like(mono_audio)
     
     # Crossfade length (in samples)
     crossfade_length = overlap_size
@@ -269,18 +243,17 @@ def main():
                 # Only fade the first part of overlap
                 fade_region_end = overlap_start + fade_len
                 
-                # Fade out the end of previous chunk
+                # Fade out the end of previous chunk (mono) and add faded current chunk
                 prev_fade_start = prev_overlap_start
                 prev_fade_end = prev_fade_start + fade_len
-                output[overlap_start:fade_region_end] = (
-                    output[overlap_start:fade_region_end] * fade_out[:, np.newaxis]
-                )
-                
+                # Elementwise multiply 1D arrays
+                output[overlap_start:fade_region_end] *= fade_out
+
                 # Fade in the beginning of current chunk and add
                 curr_fade_start = curr_overlap_start
                 curr_fade_end = curr_fade_start + fade_len
                 output[overlap_start:fade_region_end] += (
-                    processed_chunk[curr_fade_start:curr_fade_end] * fade_in[:, np.newaxis]
+                    processed_chunk[curr_fade_start:curr_fade_end] * fade_in
                 )
                 
                 # After crossfade region, just use current chunk
@@ -298,7 +271,7 @@ def main():
     
     # Save output
     logging.info("Saving output file...")
-    sf.write('output.phsc2.wav', output, sr)
+    sf.write('output.phxc2.wav', output, sr)
     logging.info("Multiprocess processing complete!")
 
 

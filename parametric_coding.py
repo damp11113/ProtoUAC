@@ -306,6 +306,12 @@ class PSDecoder:
         # Convert back to L/R
         left_out = mid + side_widened
         right_out = mid - side_widened
+        
+        max_val = max(np.max(np.abs(left_out)), np.max(np.abs(right_out)))
+        if max_val > 1.0:
+            left_out /= max_val
+            right_out /= max_val
+
         return left_out, right_out
         
     def apply(
