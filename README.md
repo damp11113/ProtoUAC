@@ -4,6 +4,14 @@ A Ultimate Audio Coding prototype in python. This codec is use compression algor
 
 Email to `contact@damp11113.xyz` for get STD_TEST file for testing this codec.
 
+## Branches
+
+- `UAC-E`: Experimental encoder techniques
+- `UAC-LC`: Low-complexity encoder line
+
+These branches represent different codec approaches and are not intended
+to be merged.
+
 # To Do
 Profiles
 - UAC-LC (Ultimate Audio Coding - Low Complex) 🟨 Current
