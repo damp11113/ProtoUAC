@@ -6,7 +6,7 @@ Email to `contact@damp11113.xyz` for get STD_TEST file for testing this codec.
 
 ## Branches
 
-- `UAC-E`: Experimental encoder techniques
+- `UAC-E`: Efficiency encoder techniques
 - `UAC-LC`: Low-complexity encoder line
 
 These branches represent different codec approaches and are not intended
